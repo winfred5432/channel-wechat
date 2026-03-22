@@ -123,6 +123,18 @@ export class Gateway {
 
           log("info", `Ingress from ${msg.from_user_id} text=${JSON.stringify(text.slice(0, 80))}`, this.config);
 
+          // Immediately show typing indicator before LLM processing begins
+          try {
+            const sessionState = this.sessions.get(sessionKey);
+            await sendMessage(
+              this.config.apiBase, token, msg.from_user_id,
+              "...", sessionState?.contextToken, fetchFn, 1,
+            );
+            log("debug", `Typing indicator sent to ${msg.from_user_id}`, this.config);
+          } catch (err) {
+            log("debug", `Typing indicator failed (non-fatal): ${String(err)}`, this.config);
+          }
+
           try {
             await ingress(
               this.config.daemonUrl,
