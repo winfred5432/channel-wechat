@@ -1,0 +1,28 @@
+{
+  "name": "@openduo/channel-wechat",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "WeChat channel adapter for openduo",
+  "main": "dist/index.js",
+  "bin": { "openduo-wechat": "./dist/index.js" },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@openduo/protocol": "^0.2.4",
+    "qrcode": "^1.5.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/qrcode": "^1.5.5",
+    "@vitest/coverage-v8": "^2",
+    "tsx": "^4",
+    "typescript": "^5",
+    "vitest": "^2"
+  },
+  "engines": { "node": ">=20" }
+}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+coverage/
+*.tgz
+
+# State files — never commit credentials
+credentials.json
+sync-buf.txt
