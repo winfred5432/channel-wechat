@@ -1,6 +1,6 @@
 import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
-import { getUpdates, sendMessage, WechatApiError } from "./wechat.js";
+import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "./wechat.js";
 import { ingress, pull, ack } from "./daemon.js";
 
 const CONSUMER_ID = "channel-wechat";
@@ -35,7 +35,12 @@ export class Gateway {
     toUser: string;
     contextToken: string | undefined;
     cursor: string;
+    stopTyping?: () => void;
   }>();
+
+  // Per-user typing ticket cache. typing_ticket is fetched via getConfig and cached.
+  private readonly typingTickets = new Map<string, { ticket: string; fetchedAt: number }>();
+  private readonly TYPING_TICKET_TTL_MS = 20 * 60 * 60 * 1000; // 20h (official 24h, conservative)
 
   constructor(
     private readonly config: Config,
@@ -122,6 +127,15 @@ export class Gateway {
           }
 
           log("info", `Ingress from ${msg.from_user_id} text=${JSON.stringify(text.slice(0, 80))}`, this.config);
+
+          // Start typing indicator (fire-and-forget; errors must not block ingress)
+          void this.getTypingTicket(msg.from_user_id, msg.context_token, fetchFn).then(ticket => {
+            if (!ticket) return;
+            const session = this.sessions.get(sessionKey);
+            if (!session) return;
+            session.stopTyping?.();
+            session.stopTyping = this.startTyping(msg.from_user_id, ticket, fetchFn);
+          });
 
           try {
             await ingress(
@@ -235,6 +249,12 @@ export class Gateway {
               }
             }
           }
+
+          // Stop typing indicator after all payloads delivered
+          if (payloads.length > 0 && state.stopTyping) {
+            state.stopTyping();
+            state.stopTyping = undefined;
+          }
         } catch (err) {
           if ((err as Error)?.name === "AbortError") return;
           consecutiveErrors++;
@@ -253,6 +273,43 @@ export class Gateway {
         }
       }
     }
+  }
+
+  private async getTypingTicket(
+    userId: string,
+    contextToken: string | undefined,
+    fetchFn: typeof fetch,
+  ): Promise<string | undefined> {
+    const cached = this.typingTickets.get(userId);
+    if (cached && Date.now() - cached.fetchedAt < this.TYPING_TICKET_TTL_MS) {
+      return cached.ticket;
+    }
+    try {
+      const token = await this.auth.getToken();
+      const resp = await getConfig(this.config.apiBase, token, userId, contextToken, fetchFn);
+      if (resp.typing_ticket) {
+        this.typingTickets.set(userId, { ticket: resp.typing_ticket, fetchedAt: Date.now() });
+        return resp.typing_ticket;
+      }
+    } catch (err) {
+      log("debug", `getTypingTicket failed for ${userId}: ${String(err)}`, this.config);
+    }
+    return undefined;
+  }
+
+  private startTyping(userId: string, typingTicket: string, fetchFn: typeof fetch): () => void {
+    const doSend = async (status: 1 | 2) => {
+      try {
+        const token = await this.auth.getToken();
+        await sendTyping(this.config.apiBase, token, userId, typingTicket, status, fetchFn);
+      } catch { /* ignore */ }
+    };
+    void doSend(1);
+    const timer = setInterval(() => void doSend(1), 5000);
+    return () => {
+      clearInterval(timer);
+      void doSend(2);
+    };
   }
 
   private isAllowed(userId: string): boolean {
