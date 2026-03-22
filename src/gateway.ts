@@ -5,13 +5,13 @@ import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
 import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "./wechat.js";
 import { downloadMedia, uploadMedia } from "./media.js";
-import { ingress, pull, ack } from "./daemon.js";
+import { ingress, subscribePull } from "./daemon.js";
 
 const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
 
 const CONSUMER_ID = "channel-wechat";
-const PULL_WAIT_MS = 10_000;
-const PULL_LIMIT = 10;
+const WS_RECONNECT_MS = 3_000;
+const SLOW_RECONNECT_MS = 30_000;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const BACKOFF_MS = 30_000;
 
@@ -98,6 +98,10 @@ export class Gateway {
         await this.auth.saveSyncBuf(newSyncBuf);
         consecutiveErrors = 0;
 
+        if (msgs.length > 0) {
+          log("debug", `getUpdates: ${msgs.length} msgs, types=${msgs.map(m => `msg_type=${m.message_type} items=[${m.item_list?.map(i => i.type).join(",")}]`).join(" | ")}`, this.config);
+        }
+
         for (const msg of msgs) {
           // Skip bot outgoing echoes (message_type 2), only process user messages (type 1)
           if (msg.message_type === 2) continue;
@@ -106,6 +110,8 @@ export class Gateway {
             log("debug", `Blocked message from ${msg.from_user_id}`, this.config);
             continue;
           }
+
+          log("debug", `raw item_list from ${msg.from_user_id}: ${JSON.stringify(msg.item_list)}`, this.config);
 
           const text = msg.item_list
             ?.filter(i => i.type === 1 && i.text_item?.text)
@@ -119,11 +125,12 @@ export class Gateway {
           for (const item of msg.item_list ?? []) {
             try {
               if (item.type === 2 && item.image_item?.media?.encrypt_query_param) {
-                // IMAGE — official impl: prefer image_item.aeskey (hex) over media.aes_key (base64)
+                // IMAGE
+                // aeskey (hex string) and media.aes_key (base64 of that hex string) are equivalent.
+                // parseAesKey handles both base64(raw 16 bytes) and base64(hex 32 chars).
+                // media.aes_key = base64(aeskey) so it is always the correct form for parseAesKey.
                 const img = item.image_item;
-                const aesKeyBase64 = img.aeskey
-                  ? Buffer.from(img.aeskey, "hex").toString("base64")
-                  : img.media!.aes_key;
+                const aesKeyBase64 = img.media!.aes_key ?? (img.aeskey ? Buffer.from(img.aeskey).toString("base64") : undefined);
                 if (!aesKeyBase64) continue;
                 const buf = await downloadMedia({
                   cdnBaseUrl: this.config.cdnBase,
@@ -255,140 +262,147 @@ export class Gateway {
   }
 
   /**
-   * pullLoop — permanent loop that drains the daemon outbox and delivers
-   * replies back to WeChat.
+   * pullLoop — establishes a persistent WebSocket subscription per session,
+   * delivering daemon outbox messages back to WeChat.
    *
-   * One pull call per known session per iteration. New sessions registered
-   * by ingressLoop are picked up automatically on the next pass.
-   * Never exits while running — no idle timeout.
+   * Uses `subscribePull` so the daemon registers `channel_capabilities`
+   * server-side (via wit()), enabling attachment delivery.
    */
   private async pullLoop(fetchFn: typeof fetch): Promise<void> {
-    let consecutiveErrors = 0;
-    log("info", "pullLoop started", this.config);
+    log("info", "pullLoop started (WebSocket mode)", this.config);
 
-    while (this.running) {
-      log("debug", "pullLoop tick", this.config);
+    // sessionKey → WS cleanup function
+    const wsCleanups = new Map<string, () => void>();
+    // Per-session consecutive error count
+    const errorCounts = new Map<string, number>();
 
-      if (this.sessions.size === 0) {
-        await sleep(1_000, this.abortController.signal);
-        continue;
-      }
+    const ensureSubscribed = (sessionKey: string, state: {
+      toUser: string;
+      contextToken: string | undefined;
+      cursor: string;
+      stopTyping?: () => void;
+    }) => {
+      if (wsCleanups.has(sessionKey)) return;
 
-      for (const [sessionKey, state] of this.sessions) {
-        if (!this.running) break;
-        try {
+      log("info", `WS subscribing for ${sessionKey}`, this.config);
+
+      const cleanup = subscribePull({
+        daemonUrl: this.config.daemonUrl,
+        sessionKey,
+        consumerId: CONSUMER_ID,
+        cursor: state.cursor || undefined,
+        sourceKind: "wechat",
+        onOutput: async (payload) => {
           const token = await this.auth.getToken();
-          const payloads = await pull(
-            this.config.daemonUrl,
-            {
-              session_key: sessionKey,
-              consumer_id: CONSUMER_ID,
-              cursor: state.cursor || undefined,
-              limit: PULL_LIMIT,
-              wait_ms: PULL_WAIT_MS,
-              return_mask: ["final"],
-              accept_mime: ["*/*"],
-            },
-            fetchFn,
-          );
 
-          consecutiveErrors = 0;
-
-          for (const payload of payloads) {
-            // Outbound: send image if mediaUrl present, then text
-            if (payload.mediaUrl) {
-              log("info", `Sending image to ${state.toUser}: ${payload.mediaUrl.slice(0, 80)}`, this.config);
-              try {
-                const uploaded = await uploadMedia({
-                  apiBase: this.config.apiBase,
-                  cdnBase: this.config.cdnBase,
-                  token,
-                  filePath: payload.mediaUrl.startsWith("file://")
-                    ? new URL(payload.mediaUrl).pathname
-                    : payload.mediaUrl,
-                  toUserId: state.toUser,
-                  fetchFn,
-                });
-                await sendMessage(
-                  this.config.apiBase,
-                  token,
-                  state.toUser,
-                  payload.text ?? "",
-                  state.contextToken,
-                  fetchFn,
-                  undefined,
-                  { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext },
-                );
-              } catch (err) {
-                log("error", `sendImage failed to ${state.toUser}: ${String(err)}`, this.config);
-                // Fall through to send text only if image failed
-                if (payload.text) {
-                  await sendMessage(this.config.apiBase, token, state.toUser, payload.text, state.contextToken, fetchFn).catch(e =>
-                    log("error", `sendMessage fallback failed: ${String(e)}`, this.config)
-                  );
-                }
+          if (payload.mediaUrl) {
+            log("info", `Sending image to ${state.toUser}: ${payload.mediaUrl.slice(0, 80)}`, this.config);
+            try {
+              const uploaded = await uploadMedia({
+                apiBase: this.config.apiBase,
+                cdnBase: this.config.cdnBase,
+                token,
+                filePath: payload.mediaUrl.startsWith("file://")
+                  ? new URL(payload.mediaUrl).pathname
+                  : payload.mediaUrl,
+                toUserId: state.toUser,
+                fetchFn,
+              });
+              await sendMessage(
+                this.config.apiBase,
+                token,
+                state.toUser,
+                payload.text ?? "",
+                state.contextToken,
+                fetchFn,
+                undefined,
+                { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext },
+              );
+            } catch (err) {
+              if (err instanceof WechatApiError && err.errcode === -14) {
+                this.auth.invalidateToken();
               }
-            } else if (payload.text) {
-              log("info", `Sending reply to ${state.toUser}: ${payload.text.slice(0, 60)}`, this.config);
-              try {
-                await sendMessage(
-                  this.config.apiBase,
-                  token,
-                  state.toUser,
-                  payload.text,
-                  state.contextToken,
-                  fetchFn,
+              log("error", `sendImage failed to ${state.toUser}: ${String(err)}`, this.config);
+              if (payload.text) {
+                await sendMessage(this.config.apiBase, token, state.toUser, payload.text, state.contextToken, fetchFn).catch(e =>
+                  log("error", `sendMessage fallback failed: ${String(e)}`, this.config)
                 );
-              } catch (err) {
-                if (err instanceof WechatApiError && err.errcode === -14) {
-                  this.auth.invalidateToken();
-                  throw err;
-                }
-                log("error", `sendMessage failed to ${state.toUser}: ${String(err)}`, this.config);
               }
             }
-
-            // Always ack to advance cursor, even if sendMessage failed —
-            // prevents a bad record from blocking the entire outbox forever
-            const raw = payload.raw as Record<string, unknown> | null;
-            const cursor = typeof raw?.id === "string" ? raw.id : null;
-            if (cursor) {
-              try {
-                await ack(
-                  this.config.daemonUrl,
-                  { session_key: sessionKey, consumer_id: CONSUMER_ID, cursor },
-                  fetchFn,
-                );
-                state.cursor = cursor;
-              } catch (err) {
-                log("warn", `ack failed (cursor=${cursor}): ${String(err)}`, this.config);
+          } else if (payload.text) {
+            log("info", `Sending reply to ${state.toUser}: ${payload.text.slice(0, 60)}`, this.config);
+            try {
+              await sendMessage(
+                this.config.apiBase,
+                token,
+                state.toUser,
+                payload.text,
+                state.contextToken,
+                fetchFn,
+              );
+            } catch (err) {
+              if (err instanceof WechatApiError && err.errcode === -14) {
+                this.auth.invalidateToken();
               }
+              log("error", `sendMessage failed to ${state.toUser}: ${String(err)}`, this.config);
             }
           }
 
-          // Stop typing indicator after all payloads delivered
-          if (payloads.length > 0 && state.stopTyping) {
+          // Stop typing indicator after delivery
+          if (state.stopTyping) {
             state.stopTyping();
             state.stopTyping = undefined;
           }
-        } catch (err) {
-          if ((err as Error)?.name === "AbortError") return;
-          consecutiveErrors++;
-          if (err instanceof WechatApiError && err.errcode === -14) {
-            log("warn", "pullLoop: token invalid (-14), re-login", this.config);
-            this.auth.invalidateToken();
-            consecutiveErrors = 0;
-            continue;
-          }
-          log("error", `pullLoop error for ${sessionKey} (${consecutiveErrors}): ${String(err)}`, this.config);
-          if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-            log("warn", `Backing off ${BACKOFF_MS}ms after ${MAX_CONSECUTIVE_ERRORS} errors`, this.config);
-            await sleep(BACKOFF_MS);
-            consecutiveErrors = 0;
-          }
+        },
+        onAck: (cursor) => {
+          state.cursor = cursor;
+          errorCounts.set(sessionKey, 0);
+        },
+        onError: (err) => {
+          const count = (errorCounts.get(sessionKey) ?? 0) + 1;
+          errorCounts.set(sessionKey, count);
+          log("error", `WS error for ${sessionKey} (${count}): ${String(err)}`, this.config);
+        },
+        onClose: () => {
+          wsCleanups.delete(sessionKey);
+          if (!this.running) return;
+          const errors = errorCounts.get(sessionKey) ?? 0;
+          const delay = errors >= MAX_CONSECUTIVE_ERRORS ? SLOW_RECONNECT_MS : WS_RECONNECT_MS;
+          log("info", `WS closed for ${sessionKey}, reconnecting in ${delay}ms`, this.config);
+          setTimeout(() => {
+            if (this.running && this.sessions.has(sessionKey)) {
+              const s = this.sessions.get(sessionKey)!;
+              ensureSubscribed(sessionKey, s);
+            }
+          }, delay);
+        },
+      });
+
+      wsCleanups.set(sessionKey, cleanup);
+    };
+
+    while (this.running) {
+      // Subscribe any new sessions
+      for (const [sessionKey, state] of this.sessions) {
+        ensureSubscribed(sessionKey, state);
+      }
+
+      // Clean up WS connections for sessions that have disappeared
+      for (const [sessionKey, cleanup] of wsCleanups) {
+        if (!this.sessions.has(sessionKey)) {
+          cleanup();
+          wsCleanups.delete(sessionKey);
         }
       }
+
+      await sleep(1_000, this.abortController.signal);
     }
+
+    // Shut down all connections on stop
+    for (const cleanup of wsCleanups.values()) {
+      cleanup();
+    }
+    wsCleanups.clear();
   }
 
   private async getTypingTicket(
