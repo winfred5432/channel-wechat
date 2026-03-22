@@ -294,38 +294,44 @@ export class Gateway {
         sourceKind: "wechat",
         onOutput: async (payload) => {
           const token = await this.auth.getToken();
+          const attachments = payload.attachments ?? [];
 
-          if (payload.mediaUrl) {
-            log("info", `Sending image to ${state.toUser}: ${payload.mediaUrl.slice(0, 80)}`, this.config);
-            try {
-              const uploaded = await uploadMedia({
-                apiBase: this.config.apiBase,
-                cdnBase: this.config.cdnBase,
-                token,
-                filePath: payload.mediaUrl.startsWith("file://")
-                  ? new URL(payload.mediaUrl).pathname
-                  : payload.mediaUrl,
-                toUserId: state.toUser,
-                fetchFn,
-              });
-              await sendMessage(
-                this.config.apiBase,
-                token,
-                state.toUser,
-                payload.text ?? "",
-                state.contextToken,
-                fetchFn,
-                { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext },
-              );
-            } catch (err) {
-              if (err instanceof WechatApiError && err.errcode === -14) {
-                this.auth.invalidateToken();
-              }
-              log("error", `sendImage failed to ${state.toUser}: ${String(err)}`, this.config);
-              if (payload.text) {
-                await sendMessage(this.config.apiBase, token, state.toUser, payload.text, state.contextToken, fetchFn).catch(e =>
-                  log("error", `sendMessage fallback failed: ${String(e)}`, this.config)
+          if (attachments.length > 0) {
+            // Send each attachment, then the text (if any) after the last one
+            for (let i = 0; i < attachments.length; i++) {
+              const att = attachments[i];
+              const isLast = i === attachments.length - 1;
+              const textForThisItem = isLast ? (payload.text ?? "") : "";
+              log("info", `Sending attachment to ${state.toUser}: ${att.path} (${att.mime})`, this.config);
+              try {
+                const uploaded = await uploadMedia({
+                  apiBase: this.config.apiBase,
+                  cdnBase: this.config.cdnBase,
+                  token,
+                  filePath: att.path.startsWith("file://") ? new URL(att.path).pathname : att.path,
+                  toUserId: state.toUser,
+                  fetchFn,
+                });
+                await sendMessage(
+                  this.config.apiBase,
+                  token,
+                  state.toUser,
+                  textForThisItem,
+                  state.contextToken,
+                  fetchFn,
+                  { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext },
                 );
+              } catch (err) {
+                if (err instanceof WechatApiError && err.errcode === -14) {
+                  this.auth.invalidateToken();
+                }
+                log("error", `sendAttachment failed to ${state.toUser}: ${String(err)}`, this.config);
+                // Fallback: send text only for the last attachment
+                if (isLast && payload.text) {
+                  await sendMessage(this.config.apiBase, token, state.toUser, payload.text, state.contextToken, fetchFn).catch(e =>
+                    log("error", `sendMessage fallback failed: ${String(e)}`, this.config)
+                  );
+                }
               }
             }
           } else if (payload.text) {
