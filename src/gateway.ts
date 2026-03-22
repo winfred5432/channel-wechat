@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
 import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "./wechat.js";
-import { downloadMedia } from "./media.js";
+import { downloadMedia, uploadMedia } from "./media.js";
 import { ingress, pull, ack } from "./daemon.js";
 
 const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
@@ -136,12 +136,7 @@ export class Gateway {
             }
           }
 
-          const imagePrefix = imagePaths.map(p => `[图片: ${p}]`).join("\n");
-          const combinedText = imagePrefix
-            ? (text ? `${imagePrefix}\n${text}` : imagePrefix)
-            : text;
-
-          if (!combinedText) {
+          if (!text && imagePaths.length === 0) {
             log("debug", `Non-text/image message from ${msg.from_user_id}, skipping`, this.config);
             continue;
           }
@@ -177,7 +172,8 @@ export class Gateway {
               this.config.daemonUrl,
               {
                 session_key: sessionKey,
-                text: combinedText,
+                text: text || undefined,
+                attachments: imagePaths.map(p => ({ path: p, mime: "image/jpeg" })),
                 idempotency_key: String(msg.message_id),
                 source_kind: "wechat",
                 channel_id: `wechat-${msg.from_user_id.replace(/[^A-Za-z0-9_-]/g, "_")}`,
@@ -240,6 +236,7 @@ export class Gateway {
               limit: PULL_LIMIT,
               wait_ms: PULL_WAIT_MS,
               return_mask: ["final"],
+              accept_mime: ["image/*"],
             },
             fetchFn,
           );
@@ -247,8 +244,40 @@ export class Gateway {
           consecutiveErrors = 0;
 
           for (const payload of payloads) {
-            // TODO: support outbound image sending via uploadMedia + sendMessage(imageItem)
-            if (payload.text) {
+            // Outbound: send image if mediaUrl present, then text
+            if (payload.mediaUrl) {
+              log("info", `Sending image to ${state.toUser}: ${payload.mediaUrl.slice(0, 80)}`, this.config);
+              try {
+                const uploaded = await uploadMedia({
+                  apiBase: this.config.apiBase,
+                  cdnBase: this.config.cdnBase,
+                  token,
+                  filePath: payload.mediaUrl.startsWith("file://")
+                    ? new URL(payload.mediaUrl).pathname
+                    : payload.mediaUrl,
+                  toUserId: state.toUser,
+                  fetchFn,
+                });
+                await sendMessage(
+                  this.config.apiBase,
+                  token,
+                  state.toUser,
+                  payload.text ?? "",
+                  state.contextToken,
+                  fetchFn,
+                  undefined,
+                  { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext },
+                );
+              } catch (err) {
+                log("error", `sendImage failed to ${state.toUser}: ${String(err)}`, this.config);
+                // Fall through to send text only if image failed
+                if (payload.text) {
+                  await sendMessage(this.config.apiBase, token, state.toUser, payload.text, state.contextToken, fetchFn).catch(e =>
+                    log("error", `sendMessage fallback failed: ${String(e)}`, this.config)
+                  );
+                }
+              }
+            } else if (payload.text) {
               log("info", `Sending reply to ${state.toUser}: ${payload.text.slice(0, 60)}`, this.config);
               try {
                 await sendMessage(
