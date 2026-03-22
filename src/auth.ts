@@ -6,10 +6,9 @@ import { getQrCode, pollQrStatus, WechatApiError } from "./wechat.js";
 interface Credentials {
   token: string;
   botId?: string;
-  expiresAt: number; // unix ms
+  // No expiresAt — ilink bot tokens have an unknown TTL (potentially days).
+  // Token expiry is detected via -14 error responses, not a proactive timer.
 }
-
-const TOKEN_TTL_MS = 6 * 60 * 60 * 1000; // 6h conservative TTL
 
 export class Auth {
   private readonly credFile: string;
@@ -29,11 +28,11 @@ export class Auth {
   }
 
   async getToken(): Promise<string> {
-    if (this.cached && this.cached.expiresAt > Date.now()) {
+    if (this.cached) {
       return this.cached.token;
     }
     const saved = await this.loadCredentials();
-    if (saved && saved.expiresAt > Date.now()) {
+    if (saved) {
       this.cached = saved;
       return saved.token;
     }
@@ -72,7 +71,6 @@ export class Auth {
         const creds: Credentials = {
           token: result.token,
           botId: result.botId,
-          expiresAt: Date.now() + TOKEN_TTL_MS,
         };
         await this.saveCredentials(creds);
         this.cached = creds;
@@ -110,6 +108,8 @@ export class Auth {
 
   invalidateToken(): void {
     this.cached = null;
+    // Also remove the persisted credentials so next getToken() triggers QR login
+    unlink(this.credFile).catch(() => { /* ignore if already gone */ });
   }
 
   private async loadCredentials(): Promise<Credentials | null> {
