@@ -40,7 +40,7 @@ export function loadConfig(): Config {
   return {
     daemonUrl: process.env.ALADUO_DAEMON_URL ?? "http://127.0.0.1:20233",
     apiBase: process.env.WECHAT_API_BASE ?? "https://ilinkai.weixin.qq.com",
-    cdnBase: process.env.WECHAT_CDN_BASE ?? "https://cdn.ilinkai.weixin.qq.com",
+    cdnBase: process.env.WECHAT_CDN_BASE ?? "https://novac2c.cdn.weixin.qq.com/c2c",
     dmPolicy,
     allowFrom,
     stateDir,
