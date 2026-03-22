@@ -1,7 +1,13 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
 import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "./wechat.js";
+import { downloadMedia } from "./media.js";
 import { ingress, pull, ack } from "./daemon.js";
+
+const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
+const WECHAT_CDN_BASE = "https://cdn.ilinkai.weixin.qq.com";
 
 const CONSUMER_ID = "channel-wechat";
 const PULL_WAIT_MS = 10_000;
@@ -106,8 +112,38 @@ export class Gateway {
             .map(i => i.text_item!.text)
             .join("") ?? "";
 
-          if (!text) {
-            log("debug", `Non-text message from ${msg.from_user_id}, skipping`, this.config);
+          // Handle image items (type:2) — download, decrypt, save to tmp file
+          const imageItems = msg.item_list?.filter(i => i.type === 2) ?? [];
+          const imagePaths: string[] = [];
+          for (const imgItem of imageItems) {
+            const media = (imgItem as { image_item?: { media?: { encrypt_query_param?: string; aes_key?: string } } }).image_item?.media;
+            if (!media?.encrypt_query_param || !media?.aes_key) continue;
+            try {
+              await mkdir(MEDIA_TMP_DIR, { recursive: true });
+              const buf = await downloadMedia({
+                cdnBaseUrl: WECHAT_CDN_BASE,
+                encryptQueryParam: media.encrypt_query_param,
+                aesKeyBase64: media.aes_key,
+                fetchFn,
+              });
+              const ext = "jpg";
+              const fname = `${Date.now()}-${randomBytes(4).toString("hex")}.${ext}`;
+              const fpath = `${MEDIA_TMP_DIR}/${fname}`;
+              await writeFile(fpath, buf);
+              imagePaths.push(fpath);
+              log("info", `Downloaded image to ${fpath} (${buf.length} bytes)`, this.config);
+            } catch (err) {
+              log("warn", `Failed to download image from CDN: ${String(err)}`, this.config);
+            }
+          }
+
+          const imagePrefix = imagePaths.map(p => `[图片: ${p}]`).join("\n");
+          const combinedText = imagePrefix
+            ? (text ? `${imagePrefix}\n${text}` : imagePrefix)
+            : text;
+
+          if (!combinedText) {
+            log("debug", `Non-text/image message from ${msg.from_user_id}, skipping`, this.config);
             continue;
           }
 
@@ -126,7 +162,7 @@ export class Gateway {
             });
           }
 
-          log("info", `Ingress from ${msg.from_user_id} text=${JSON.stringify(text.slice(0, 80))}`, this.config);
+          log("info", `Ingress from ${msg.from_user_id} text=${JSON.stringify(combinedText.slice(0, 80))}`, this.config);
 
           // Start typing indicator (fire-and-forget; errors must not block ingress)
           void this.getTypingTicket(msg.from_user_id, msg.context_token, fetchFn).then(ticket => {
@@ -142,7 +178,7 @@ export class Gateway {
               this.config.daemonUrl,
               {
                 session_key: sessionKey,
-                text,
+                text: combinedText,
                 idempotency_key: String(msg.message_id),
                 source_kind: "wechat",
                 channel_id: `wechat-${msg.from_user_id.replace(/[^A-Za-z0-9_-]/g, "_")}`,
@@ -212,6 +248,7 @@ export class Gateway {
           consecutiveErrors = 0;
 
           for (const payload of payloads) {
+            // TODO: support outbound image sending via uploadMedia + sendMessage(imageItem)
             if (payload.text) {
               log("info", `Sending reply to ${state.toUser}: ${payload.text.slice(0, 60)}`, this.config);
               try {

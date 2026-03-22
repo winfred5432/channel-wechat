@@ -6,6 +6,13 @@ export const CHUNK_SIZE = 4000;
 interface WechatMsgItem {
   type: number;
   text_item?: { text: string };
+  image_item?: {
+    media?: {
+      encrypt_query_param?: string;
+      aes_key?: string;
+    };
+    mid_size?: number;
+  };
 }
 
 export interface WechatMsg {
@@ -164,6 +171,12 @@ function generateClientId(): string {
   return `cc-wx-${Date.now()}-${randomBytes(4).toString("hex")}`;
 }
 
+export interface ImageItem {
+  encryptQueryParam: string;
+  aesKeyBase64: string;
+  midSize: number;
+}
+
 export async function sendMessage(
   baseUrl: string,
   token: string,
@@ -171,8 +184,51 @@ export async function sendMessage(
   text: string,
   contextToken?: string,
   fetchFn: typeof fetch = fetch,
+  imageItem?: ImageItem,
 ): Promise<void> {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+
+  if (imageItem) {
+    // Send image message (type:2 IMAGE)
+    const msgBody: Record<string, unknown> = {
+      from_user_id: "",
+      to_user_id: toUser,
+      client_id: generateClientId(),
+      message_type: 2,
+      message_state: 2,
+      item_list: [{
+        type: 2,
+        image_item: {
+          media: {
+            encrypt_query_param: imageItem.encryptQueryParam,
+            aes_key: imageItem.aesKeyBase64,
+          },
+          mid_size: imageItem.midSize,
+        },
+      }],
+    };
+    if (contextToken) msgBody.context_token = contextToken;
+    const body = JSON.stringify({
+      msg: msgBody,
+      base_info: { channel_version: "claude-code-1.0" },
+    });
+    const res = await fetchFn(`${base}ilink/bot/sendmessage`, {
+      method: "POST",
+      headers: buildHeaders(token, body),
+      body,
+    });
+    if (!res.ok) throw new Error(`sendMessage HTTP ${res.status}`);
+    const data = (await res.json()) as SendMessageResponse;
+    const code = data.ret ?? data.errcode ?? 0;
+    if (code !== 0) throw new WechatApiError(code, data.errmsg ?? "unknown");
+
+    // Send accompanying text if provided
+    if (text) {
+      await sendMessage(baseUrl, token, toUser, text, contextToken, fetchFn);
+    }
+    return;
+  }
+
   for (const chunk of splitText(text)) {
     const msgBody: Record<string, unknown> = {
       from_user_id: "",
@@ -197,6 +253,56 @@ export async function sendMessage(
     const code = data.ret ?? data.errcode ?? 0;
     if (code !== 0) throw new WechatApiError(code, data.errmsg ?? "unknown");
   }
+}
+
+interface GetUploadUrlResponse {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  upload_param?: string;
+  upload_url?: string;
+  encrypt_query_param?: string;
+}
+
+export async function getUploadUrl(params: {
+  baseUrl: string;
+  token: string;
+  filekey: string;
+  mediaType: number;
+  toUserId: string;
+  rawsize: number;
+  rawfilemd5: string;
+  filesize: number;
+  aeskey: string;  // hex string
+  fetchFn?: typeof fetch;
+}): Promise<{ upload_url?: string; upload_param?: string; encrypt_query_param?: string }> {
+  const { baseUrl, token, fetchFn = fetch, ...rest } = params;
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const body = JSON.stringify({
+    filekey: rest.filekey,
+    media_type: rest.mediaType,
+    to_user_id: rest.toUserId,
+    rawsize: rest.rawsize,
+    rawfilemd5: rest.rawfilemd5,
+    filesize: rest.filesize,
+    no_need_thumb: true,
+    aeskey: rest.aeskey,
+    base_info: { channel_version: "claude-code-1.0" },
+  });
+  const res = await fetchFn(`${base}ilink/bot/getuploadurl`, {
+    method: "POST",
+    headers: buildHeaders(token, body),
+    body,
+  });
+  if (!res.ok) throw new Error(`getUploadUrl HTTP ${res.status}`);
+  const data = (await res.json()) as GetUploadUrlResponse;
+  const code = data.ret ?? data.errcode ?? 0;
+  if (code !== 0) throw new WechatApiError(code, data.errmsg ?? "unknown");
+  return {
+    upload_url: data.upload_url,
+    upload_param: data.upload_param,
+    encrypt_query_param: data.encrypt_query_param,
+  };
 }
 
 export function splitText(text: string, chunkSize = CHUNK_SIZE): string[] {
