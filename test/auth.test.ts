@@ -17,16 +17,22 @@ vi.mock("qrcode", () => ({
   },
 }));
 
-// Helper: QR login mock that confirms on first status poll
+// Helper: QR login mock using real ilink API response shapes
 function mockFetchImmediate(token = "REALTOKEN"): typeof fetch {
   return vi.fn().mockImplementation(async (url: string) => {
     if (url.includes("get_bot_qrcode")) {
-      return { ok: true, json: async () => ({ errcode: 0, errmsg: "ok", qrcode: "QR123", token: "session" }) };
+      return {
+        ok: true,
+        json: async () => ({ qrcode: "QR123", qrcode_img_content: "https://img.example.com/qr.png" }),
+      };
     }
     if (url.includes("get_qrcode_status")) {
-      return { ok: true, json: async () => ({ errcode: 0, errmsg: "ok", status: "confirmed", token }) };
+      return {
+        ok: true,
+        json: async () => ({ status: "confirmed", bot_token: token, ilink_bot_id: "BOT1" }),
+      };
     }
-    return { ok: true, json: async () => ({ errcode: 0, errmsg: "ok" }) };
+    return { ok: true, json: async () => ({}) };
   }) as unknown as typeof fetch;
 }
 

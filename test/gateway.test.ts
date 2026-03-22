@@ -55,7 +55,8 @@ function makeFetchSequence(
         // Schedule stop after this response resolves
         setImmediate(onExhausted);
       }
-      return { ok: true, status: 200, json: async () => response.body };
+      const bodyStr = JSON.stringify(response.body);
+      return { ok: true, status: 200, json: async () => response.body, text: async () => bodyStr };
     }
 
     // Fallback: never-resolving promise to halt the loop without tight-looping
@@ -75,10 +76,9 @@ describe("Gateway allowlist filtering", () => {
       [
         {
           body: {
-            errcode: 0,
-            errmsg: "ok",
-            msg_list: [{ msgid: "1", from: "blocked-user", content: "hi" }],
-            sync_buf: "BUF2",
+            ret: 0,
+            msgs: [{ msgid: "1", from: "blocked-user", content: "hi" }],
+            get_updates_buf: "BUF2",
           },
         },
       ],
@@ -105,10 +105,9 @@ describe("Gateway allowlist filtering", () => {
       [
         {
           body: {
-            errcode: 0,
-            errmsg: "ok",
-            msg_list: [{ msgid: "1", from: "allowed-user", content: "hi" }],
-            sync_buf: "BUF2",
+            ret: 0,
+            msgs: [{ msgid: "1", from: "allowed-user", content: "hi" }],
+            get_updates_buf: "BUF2",
           },
         },
         { body: { jsonrpc: "2.0", id: 1, result: null } },   // ingress
@@ -141,10 +140,9 @@ describe("Gateway open policy", () => {
       [
         {
           body: {
-            errcode: 0,
-            errmsg: "ok",
-            msg_list: [{ msgid: "1", from: "random-user", content: "hello" }],
-            sync_buf: "S",
+            ret: 0,
+            msgs: [{ msgid: "1", from: "random-user", content: "hello" }],
+            get_updates_buf: "S",
           },
         },
         { body: { jsonrpc: "2.0", id: 1, result: null } },  // ingress
@@ -180,10 +178,9 @@ describe("Gateway pull and send flow", () => {
       [
         {
           body: {
-            errcode: 0,
-            errmsg: "ok",
-            msg_list: [{ msgid: "m1", from: "u1", content: "question" }],
-            sync_buf: "S",
+            ret: 0,
+            msgs: [{ msgid: "m1", from: "u1", content: "question" }],
+            get_updates_buf: "S",
           },
         },
         { body: { jsonrpc: "2.0", id: 1, result: null } },  // ingress
@@ -194,7 +191,7 @@ describe("Gateway pull and send flow", () => {
             result: [{ sessionKey: "wechat:u1", text: "answer", raw: { outbox_id: "OBX1" } }],
           },
         },
-        { body: { errcode: 0, errmsg: "ok" } },              // sendmessage
+        { body: { ret: 0 } },                                  // sendmessage
         { body: { jsonrpc: "2.0", id: 3, result: null } },   // ack
         { body: { jsonrpc: "2.0", id: 4, result: [] } },     // next pull (empty)
       ],
@@ -210,7 +207,7 @@ describe("Gateway pull and send flow", () => {
 
     const sendCalls = calls.filter((c) => c.url.includes("sendmessage"));
     expect(sendCalls.length).toBeGreaterThanOrEqual(1);
-    expect(sendCalls[0].body?.to).toBe("u1");
+    expect(sendCalls[0].body?.to_user).toBe("u1");
     expect(sendCalls[0].body?.content).toBe("answer");
   });
 });
@@ -225,11 +222,13 @@ describe("Gateway error recovery", () => {
     const fetchFn = vi.fn().mockImplementation(async () => {
       callCount++;
       if (callCount === 1) {
-        return { ok: true, json: async () => ({ errcode: -14, errmsg: "token invalid" }) };
+        const b1 = JSON.stringify({ ret: -14, errmsg: "token invalid" });
+        return { ok: true, json: async () => JSON.parse(b1), text: async () => b1 };
       }
       // Second call: succeed, then stop
       setImmediate(() => gateway.stop());
-      return { ok: true, json: async () => ({ errcode: 0, errmsg: "ok", msg_list: [], sync_buf: "" }) };
+      const b2 = JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "" });
+      return { ok: true, json: async () => JSON.parse(b2), text: async () => b2 };
     }) as unknown as typeof fetch;
 
     gateway = new Gateway(config, auth, fetchFn);
