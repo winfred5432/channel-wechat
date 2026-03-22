@@ -41,19 +41,20 @@ export class Auth {
   }
 
   async startQrLogin(): Promise<string> {
-    const { qrcode: qrcodeStr } = await getQrCode(this.apiBase, this.fetchFn);
+    // qrcode: used for polling status; qrcodeImgUrl: the actual QR image URL
+    const { qrcode: qrcodeStr, qrcodeImgUrl } = await getQrCode(this.apiBase, this.fetchFn);
 
     await this.ensureStateDir();
 
-    // Render QR URL to PNG file (lazy import to keep module graph light)
+    // Render QR image URL to PNG file so agent can send it via Feishu attachment
     const QRCode = (await import("qrcode")).default;
-    await QRCode.toFile(this.qrcodePng, qrcodeStr, { type: "png", width: 300 });
+    await QRCode.toFile(this.qrcodePng, qrcodeImgUrl, { type: "png", width: 300 });
 
     // Signal to agent: PNG is ready at this path
     process.stdout.write(`QRCODE_READY:${this.qrcodePng}\n`);
 
     // Long-poll until confirmed or expired
-    const deadline = Date.now() + 3 * 60 * 1000;
+    const deadline = Date.now() + 8 * 60 * 1000; // 8 min (matches reference impl)
     while (Date.now() < deadline) {
       await sleep(this.pollIntervalMs);
       let result: { status: string; token?: string; botId?: string };
@@ -87,10 +88,10 @@ export class Auth {
         await this.cleanupQrPng();
         return this.startQrLogin();
       }
-      // waiting or scanned — keep polling
+      // wait / scanned — keep polling
     }
     await this.cleanupQrPng();
-    throw new Error("QR login timed out after 3 minutes");
+    throw new Error("QR login timed out after 8 minutes");
   }
 
   async getSyncBuf(): Promise<string> {

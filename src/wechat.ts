@@ -1,3 +1,5 @@
+import { randomBytes } from "node:crypto";
+
 export const WECHAT_BASE = "https://ilinkai.weixin.qq.com";
 export const CHUNK_SIZE = 4000;
 
@@ -11,30 +13,32 @@ export interface WechatMsg {
   context_token?: string;
 }
 
+// Real API response shapes (verified against reference impl codeyq/wechat-claude-code-channel)
 interface QrCodeResponse {
-  errcode: number;
-  errmsg: string;
-  qrcode: string;
-  token: string;
+  qrcode: string;             // used for pollQrStatus
+  qrcode_img_content: string; // QR image URL → render to PNG
 }
 
 interface QrStatusResponse {
-  errcode: number;
-  errmsg: string;
-  status: "waiting" | "scanned" | "confirmed" | "expired";
-  token?: string;
+  status: "wait" | "scaned" | "confirmed" | "expired";
+  bot_token?: string;
+  ilink_bot_id?: string;
+  ilink_user_id?: string;
+  baseurl?: string;
 }
 
 interface GetUpdatesResponse {
-  errcode: number;
-  errmsg: string;
-  msg_list?: WechatMsg[];
-  sync_buf?: string;
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  msgs?: WechatMsg[];
+  get_updates_buf?: string;
 }
 
 interface SendMessageResponse {
-  errcode: number;
-  errmsg: string;
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
 }
 
 export class WechatApiError extends Error {
@@ -47,29 +51,73 @@ export class WechatApiError extends Error {
   }
 }
 
+/** X-WECHAT-UIN: base64 of a random uint32 string (matches reference impl) */
+function randomWechatUin(): string {
+  const uint32 = randomBytes(4).readUInt32BE(0);
+  return Buffer.from(String(uint32), "utf-8").toString("base64");
+}
+
+/** Build required headers for ilink bot API POST requests */
+function buildHeaders(token: string | undefined, body: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Content-Length": String(Buffer.byteLength(body, "utf-8")),
+    AuthorizationType: "ilink_bot_token",
+    "X-WECHAT-UIN": randomWechatUin(),
+  };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+  return headers;
+}
+
 export async function getQrCode(
   baseUrl: string,
   fetchFn: typeof fetch = fetch,
-): Promise<{ qrcode: string; token: string }> {
-  const url = `${baseUrl}/ilink/bot/get_bot_qrcode?bot_type=3`;
+): Promise<{ qrcode: string; qrcodeImgUrl: string }> {
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const url = `${base}ilink/bot/get_bot_qrcode?bot_type=3`;
   const res = await fetchFn(url, { method: "GET" });
   if (!res.ok) throw new Error(`HTTP ${res.status} from getQrCode`);
   const data = (await res.json()) as QrCodeResponse;
-  if (data.errcode !== 0) throw new WechatApiError(data.errcode, data.errmsg);
-  return { qrcode: data.qrcode, token: data.token };
+  return { qrcode: data.qrcode, qrcodeImgUrl: data.qrcode_img_content };
 }
 
 export async function pollQrStatus(
   baseUrl: string,
   qrcode: string,
   fetchFn: typeof fetch = fetch,
-): Promise<{ status: QrStatusResponse["status"]; token?: string }> {
-  const url = `${baseUrl}/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`;
-  const res = await fetchFn(url, { method: "GET" });
+): Promise<{
+  status: QrStatusResponse["status"];
+  token?: string;
+  botId?: string;
+  userId?: string;
+  resolvedBaseUrl?: string;
+}> {
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const url = `${base}ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`;
+  let res: Response;
+  try {
+    res = await fetchFn(url, {
+      method: "GET",
+      headers: { "iLink-App-ClientVersion": "1" },
+      signal: AbortSignal.timeout(35_000),
+    });
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return { status: "wait" };
+    }
+    throw err;
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status} from pollQrStatus`);
   const data = (await res.json()) as QrStatusResponse;
-  if (data.errcode !== 0) throw new WechatApiError(data.errcode, data.errmsg);
-  return { status: data.status, token: data.token };
+  return {
+    status: data.status,
+    token: data.bot_token,
+    botId: data.ilink_bot_id,
+    userId: data.ilink_user_id,
+    resolvedBaseUrl: data.baseurl,
+  };
 }
 
 export async function getUpdates(
@@ -78,54 +126,62 @@ export async function getUpdates(
   syncBuf: string,
   fetchFn: typeof fetch = fetch,
 ): Promise<{ msgs: WechatMsg[]; syncBuf: string }> {
-  const url = `${baseUrl}/ilink/bot/getupdates`;
-  const res = await fetchFn(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ sync_buf: syncBuf, timeout: 35 }),
-    signal: AbortSignal.timeout(40_000),
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const body = JSON.stringify({
+    get_updates_buf: syncBuf,
+    base_info: { channel_version: "claude-code-1.0" },
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} from getUpdates`);
-  const data = (await res.json()) as GetUpdatesResponse;
-  if (data.errcode !== 0) throw new WechatApiError(data.errcode, data.errmsg);
+  let rawText: string;
+  try {
+    const res = await fetchFn(`${base}ilink/bot/getupdates`, {
+      method: "POST",
+      headers: buildHeaders(token, body),
+      body,
+      signal: AbortSignal.timeout(40_000),
+    });
+    rawText = await res.text();
+    if (!res.ok) throw new Error(`getUpdates HTTP ${res.status}: ${rawText}`);
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return { msgs: [], syncBuf };
+    }
+    throw err;
+  }
+  const data = JSON.parse(rawText) as GetUpdatesResponse;
+  const code = data.ret ?? data.errcode ?? 0;
+  if (code !== 0) throw new WechatApiError(code, data.errmsg ?? "unknown");
   return {
-    msgs: data.msg_list ?? [],
-    syncBuf: data.sync_buf ?? syncBuf,
+    msgs: data.msgs ?? [],
+    syncBuf: data.get_updates_buf ?? syncBuf,
   };
 }
 
 export async function sendMessage(
   baseUrl: string,
   token: string,
-  to: string,
+  toUser: string,
   text: string,
   contextToken?: string,
   fetchFn: typeof fetch = fetch,
 ): Promise<void> {
-  const chunks = splitText(text);
-  for (const chunk of chunks) {
-    const body: Record<string, unknown> = {
-      to,
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  for (const chunk of splitText(text)) {
+    const payload: Record<string, unknown> = {
+      to_user: toUser,
       msg_type: 1,
       content: chunk,
     };
-    if (contextToken) body.context_token = contextToken;
-
-    const url = `${baseUrl}/ilink/bot/sendmessage`;
-    const res = await fetchFn(url, {
+    if (contextToken) payload.context_token = contextToken;
+    const body = JSON.stringify(payload);
+    const res = await fetchFn(`${base}ilink/bot/sendmessage`, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
+      headers: buildHeaders(token, body),
+      body,
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status} from sendMessage`);
+    if (!res.ok) throw new Error(`sendMessage HTTP ${res.status}`);
     const data = (await res.json()) as SendMessageResponse;
-    if (data.errcode !== 0) throw new WechatApiError(data.errcode, data.errmsg);
+    const code = data.ret ?? data.errcode ?? 0;
+    if (code !== 0) throw new WechatApiError(code, data.errmsg ?? "unknown");
   }
 }
 
