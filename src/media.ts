@@ -103,13 +103,14 @@ export async function uploadMedia(params: {
   apiBase: string;
   cdnBase: string;
   token: string;
-  filePath: string;
+  /** Either a filesystem path or a pre-loaded Buffer */
+  filePath: string | Buffer;
   toUserId: string;
   fetchFn?: typeof fetch;
 }): Promise<UploadedMedia> {
   const { apiBase, cdnBase, token, filePath, toUserId, fetchFn = fetch } = params;
 
-  const plaintext = await readFile(filePath);
+  const plaintext = Buffer.isBuffer(filePath) ? filePath : await readFile(filePath);
   const rawsize = plaintext.length;
   const rawfilemd5 = createHash("md5").update(plaintext).digest("hex");
   const filesize = aesEcbPaddedSize(rawsize);

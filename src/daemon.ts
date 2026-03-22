@@ -187,3 +187,17 @@ export async function ack(
 ): Promise<void> {
   await rpc(daemonUrl, "channel.ack", params, fetchFn);
 }
+
+/**
+ * Download a file from the daemon by its internal path.
+ * Returns the raw file content as a Buffer.
+ * Used to retrieve attachment content before uploading to WeChat CDN.
+ */
+export async function fileDownload(
+  daemonUrl: string,
+  path: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<Buffer> {
+  const result = await rpc(daemonUrl, "channel.file.download", { path }, fetchFn) as { content_base64: string };
+  return Buffer.from(result.content_base64, "base64");
+}

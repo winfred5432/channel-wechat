@@ -5,7 +5,7 @@ import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
 import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "./wechat.js";
 import { downloadMedia, uploadMedia } from "./media.js";
-import { ingress, subscribePull } from "./daemon.js";
+import { ingress, subscribePull, fileDownload } from "./daemon.js";
 
 const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
 
@@ -304,11 +304,14 @@ export class Gateway {
               const textForThisItem = isLast ? (payload.text ?? "") : "";
               log("info", `Sending attachment to ${state.toUser}: ${att.path} (${att.mime})`, this.config);
               try {
+                // Download attachment content via RPC — the path is daemon-internal
+                // and the channel/session may run on different machines.
+                const fileBuffer = await fileDownload(this.config.daemonUrl, att.path, fetchFn);
                 const uploaded = await uploadMedia({
                   apiBase: this.config.apiBase,
                   cdnBase: this.config.cdnBase,
                   token,
-                  filePath: att.path.startsWith("file://") ? new URL(att.path).pathname : att.path,
+                  filePath: fileBuffer,
                   toUserId: state.toUser,
                   fetchFn,
                 });
