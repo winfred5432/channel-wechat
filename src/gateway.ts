@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
+import { extname } from "node:path";
 import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
 import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "./wechat.js";
@@ -111,33 +112,83 @@ export class Gateway {
             .map(i => i.text_item!.text)
             .join("") ?? "";
 
-          // Handle image items (type:2) — download, decrypt, save to tmp file
-          const imageItems = msg.item_list?.filter(i => i.type === 2) ?? [];
-          const imagePaths: string[] = [];
-          for (const imgItem of imageItems) {
-            const media = (imgItem as { image_item?: { media?: { encrypt_query_param?: string; aes_key?: string } } }).image_item?.media;
-            if (!media?.encrypt_query_param || !media?.aes_key) continue;
+          // Download and save all media items (image/voice/file/video)
+          await mkdir(MEDIA_TMP_DIR, { recursive: true });
+          const attachments: Array<{ path: string; mime: string }> = [];
+
+          for (const item of msg.item_list ?? []) {
             try {
-              await mkdir(MEDIA_TMP_DIR, { recursive: true });
-              const buf = await downloadMedia({
-                cdnBaseUrl: this.config.cdnBase,
-                encryptQueryParam: media.encrypt_query_param,
-                aesKeyBase64: media.aes_key,
-                fetchFn,
-              });
-              const ext = "jpg";
-              const fname = `${Date.now()}-${randomBytes(4).toString("hex")}.${ext}`;
-              const fpath = `${MEDIA_TMP_DIR}/${fname}`;
-              await writeFile(fpath, buf);
-              imagePaths.push(fpath);
-              log("info", `Downloaded image to ${fpath} (${buf.length} bytes)`, this.config);
+              if (item.type === 2 && item.image_item?.media?.encrypt_query_param) {
+                // IMAGE — official impl: prefer image_item.aeskey (hex) over media.aes_key (base64)
+                const img = item.image_item;
+                const aesKeyBase64 = img.aeskey
+                  ? Buffer.from(img.aeskey, "hex").toString("base64")
+                  : img.media!.aes_key;
+                if (!aesKeyBase64) continue;
+                const buf = await downloadMedia({
+                  cdnBaseUrl: this.config.cdnBase,
+                  encryptQueryParam: img.media!.encrypt_query_param!,
+                  aesKeyBase64,
+                  fetchFn,
+                });
+                const fpath = `${MEDIA_TMP_DIR}/${Date.now()}-${randomBytes(4).toString("hex")}.jpg`;
+                await writeFile(fpath, buf);
+                attachments.push({ path: fpath, mime: "image/jpeg" });
+                log("info", `Downloaded image → ${fpath} (${buf.length}B)`, this.config);
+
+              } else if (item.type === 3 && item.voice_item?.media?.encrypt_query_param && item.voice_item.media.aes_key) {
+                // VOICE
+                const v = item.voice_item;
+                const buf = await downloadMedia({
+                  cdnBaseUrl: this.config.cdnBase,
+                  encryptQueryParam: v.media!.encrypt_query_param!,
+                  aesKeyBase64: v.media!.aes_key!,
+                  fetchFn,
+                });
+                // Silk format by default; transcode not available here, pass as-is
+                const fpath = `${MEDIA_TMP_DIR}/${Date.now()}-${randomBytes(4).toString("hex")}.silk`;
+                await writeFile(fpath, buf);
+                attachments.push({ path: fpath, mime: "audio/silk" });
+                log("info", `Downloaded voice → ${fpath} (${buf.length}B)`, this.config);
+
+              } else if (item.type === 4 && item.file_item?.media?.encrypt_query_param && item.file_item.media.aes_key) {
+                // FILE
+                const f = item.file_item;
+                const buf = await downloadMedia({
+                  cdnBaseUrl: this.config.cdnBase,
+                  encryptQueryParam: f.media!.encrypt_query_param!,
+                  aesKeyBase64: f.media!.aes_key!,
+                  fetchFn,
+                });
+                const origName = f.file_name ?? "file.bin";
+                const ext = extname(origName) || ".bin";
+                const mime = guessMime(origName);
+                const fpath = `${MEDIA_TMP_DIR}/${Date.now()}-${randomBytes(4).toString("hex")}${ext}`;
+                await writeFile(fpath, buf);
+                attachments.push({ path: fpath, mime });
+                log("info", `Downloaded file "${origName}" → ${fpath} (${buf.length}B)`, this.config);
+
+              } else if (item.type === 5 && item.video_item?.media?.encrypt_query_param && item.video_item.media.aes_key) {
+                // VIDEO
+                const vid = item.video_item;
+                const buf = await downloadMedia({
+                  cdnBaseUrl: this.config.cdnBase,
+                  encryptQueryParam: vid.media!.encrypt_query_param!,
+                  aesKeyBase64: vid.media!.aes_key!,
+                  fetchFn,
+                });
+                const fpath = `${MEDIA_TMP_DIR}/${Date.now()}-${randomBytes(4).toString("hex")}.mp4`;
+                await writeFile(fpath, buf);
+                attachments.push({ path: fpath, mime: "video/mp4" });
+                log("info", `Downloaded video → ${fpath} (${buf.length}B)`, this.config);
+              }
             } catch (err) {
-              log("warn", `Failed to download image from CDN: ${String(err)}`, this.config);
+              log("warn", `Failed to download media item type=${item.type}: ${String(err)}`, this.config);
             }
           }
 
-          if (!text && imagePaths.length === 0) {
-            log("debug", `Non-text/image message from ${msg.from_user_id}, skipping`, this.config);
+          if (!text && attachments.length === 0) {
+            log("debug", `Non-text/media message from ${msg.from_user_id}, skipping`, this.config);
             continue;
           }
 
@@ -156,7 +207,7 @@ export class Gateway {
             });
           }
 
-          log("info", `Ingress from ${msg.from_user_id} text=${JSON.stringify(combinedText.slice(0, 80))}`, this.config);
+          log("info", `Ingress from ${msg.from_user_id} text=${JSON.stringify(text.slice(0, 80))} attachments=${attachments.length}`, this.config);
 
           // Start typing indicator (fire-and-forget; errors must not block ingress)
           void this.getTypingTicket(msg.from_user_id, msg.context_token, fetchFn).then(ticket => {
@@ -173,7 +224,7 @@ export class Gateway {
               {
                 session_key: sessionKey,
                 text: text || undefined,
-                attachments: imagePaths.map(p => ({ path: p, mime: "image/jpeg" })),
+                attachments,
                 idempotency_key: String(msg.message_id),
                 source_kind: "wechat",
                 channel_id: `wechat-${msg.from_user_id.replace(/[^A-Za-z0-9_-]/g, "_")}`,
@@ -236,7 +287,7 @@ export class Gateway {
               limit: PULL_LIMIT,
               wait_ms: PULL_WAIT_MS,
               return_mask: ["final"],
-              accept_mime: ["image/*"],
+              accept_mime: ["*/*"],
             },
             fetchFn,
           );
@@ -381,6 +432,35 @@ export class Gateway {
     if (this.config.dmPolicy === "open") return true;
     return this.config.allowFrom.includes(userId);
   }
+}
+
+/** Best-effort MIME type guess from filename extension. */
+function guessMime(filename: string): string {
+  const ext = extname(filename).toLowerCase();
+  const map: Record<string, string> = {
+    ".pdf":  "application/pdf",
+    ".doc":  "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls":  "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ppt":  "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".zip":  "application/zip",
+    ".txt":  "text/plain",
+    ".csv":  "text/csv",
+    ".json": "application/json",
+    ".png":  "image/png",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif":  "image/gif",
+    ".webp": "image/webp",
+    ".mp4":  "video/mp4",
+    ".mov":  "video/quicktime",
+    ".mp3":  "audio/mpeg",
+    ".m4a":  "audio/mp4",
+    ".wav":  "audio/wav",
+  };
+  return map[ext] ?? "application/octet-stream";
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

@@ -3,15 +3,41 @@ import { randomBytes } from "node:crypto";
 export const WECHAT_BASE = "https://ilinkai.weixin.qq.com";
 export const CHUNK_SIZE = 4000;
 
-interface WechatMsgItem {
+/** CDN media reference embedded in an item. */
+export interface CDNMedia {
+  encrypt_query_param?: string;
+  aes_key?: string;
+}
+
+export interface WechatMsgItem {
   type: number;
   text_item?: { text: string };
   image_item?: {
-    media?: {
-      encrypt_query_param?: string;
-      aes_key?: string;
-    };
+    media?: CDNMedia;
+    /** Raw AES-128 key as hex string (preferred over media.aes_key for inbound decryption). */
+    aeskey?: string;
     mid_size?: number;
+    hd_size?: number;
+  };
+  voice_item?: {
+    media?: CDNMedia;
+    /** Voice encoding: 1=pcm 2=adpcm 3=feature 4=speex 5=amr 6=silk 7=mp3 8=ogg-speex */
+    encode_type?: number;
+    /** Voice duration in milliseconds */
+    playtime?: number;
+    /** Voice-to-text transcription (if available) */
+    text?: string;
+  };
+  file_item?: {
+    media?: CDNMedia;
+    file_name?: string;
+    md5?: string;
+    len?: string;
+  };
+  video_item?: {
+    media?: CDNMedia;
+    video_size?: number;
+    play_length?: number;
   };
 }
 
