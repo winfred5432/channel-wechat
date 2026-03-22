@@ -1,6 +1,6 @@
 import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
-import { getUpdates, sendMessage, WechatApiError, type MessageState } from "./wechat.js";
+import { getUpdates, sendMessage, WechatApiError } from "./wechat.js";
 import { ingress, pull, ack } from "./daemon.js";
 
 const CONSUMER_ID = "channel-wechat";
@@ -123,18 +123,6 @@ export class Gateway {
 
           log("info", `Ingress from ${msg.from_user_id} text=${JSON.stringify(text.slice(0, 80))}`, this.config);
 
-          // Immediately show typing indicator before LLM processing begins
-          try {
-            const sessionState = this.sessions.get(sessionKey);
-            await sendMessage(
-              this.config.apiBase, token, msg.from_user_id,
-              "...", sessionState?.contextToken, fetchFn, 1,
-            );
-            log("debug", `Typing indicator sent to ${msg.from_user_id}`, this.config);
-          } catch (err) {
-            log("debug", `Typing indicator failed (non-fatal): ${String(err)}`, this.config);
-          }
-
           try {
             await ingress(
               this.config.daemonUrl,
@@ -202,7 +190,7 @@ export class Gateway {
               cursor: state.cursor || undefined,
               limit: PULL_LIMIT,
               wait_ms: PULL_WAIT_MS,
-              return_mask: ["final", "stream"],
+              return_mask: ["final"],
             },
             fetchFn,
           );
@@ -211,20 +199,7 @@ export class Gateway {
 
           for (const payload of payloads) {
             if (payload.text) {
-              // Derive message_state from OutboxRecord.stream:
-              //   stream present + is_final=false → 1 (SENDING, typing indicator)
-              //   stream present + is_final=true  → 2 (FINISH)
-              //   no stream field                 → 2 (FINISH, non-streaming reply)
-              const raw = payload.raw as Record<string, unknown> | null;
-              const stream = raw?.stream as { is_final?: boolean } | undefined;
-              const messageState: MessageState =
-                stream !== undefined && stream.is_final === false ? 1 : 2;
-
-              log(
-                "info",
-                `Sending reply to ${state.toUser} state=${messageState}: ${payload.text.slice(0, 60)}`,
-                this.config,
-              );
+              log("info", `Sending reply to ${state.toUser}: ${payload.text.slice(0, 60)}`, this.config);
               try {
                 await sendMessage(
                   this.config.apiBase,
@@ -233,7 +208,6 @@ export class Gateway {
                   payload.text,
                   state.contextToken,
                   fetchFn,
-                  messageState,
                 );
               } catch (err) {
                 if (err instanceof WechatApiError && err.errcode === -14) {
