@@ -209,3 +209,71 @@ export function splitText(text: string, chunkSize = CHUNK_SIZE): string[] {
   }
   return chunks;
 }
+
+export interface GetConfigResponse {
+  ret?: number;
+  errmsg?: string;
+  typing_ticket?: string;
+}
+
+export interface SendTypingResponse {
+  ret?: number;
+  errmsg?: string;
+}
+
+/**
+ * Fetch per-user bot config from ilink, primarily to get typing_ticket.
+ * typing_ticket is required for sendTyping.
+ */
+export async function getConfig(
+  baseUrl: string,
+  token: string,
+  ilinkUserId: string,
+  contextToken?: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<GetConfigResponse> {
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const body = JSON.stringify({
+    ilink_user_id: ilinkUserId,
+    context_token: contextToken,
+    base_info: {},
+  });
+  const res = await fetchFn(`${base}ilink/bot/getconfig`, {
+    method: "POST",
+    headers: buildHeaders(token, body),
+    body,
+  });
+  if (!res.ok) throw new Error(`getConfig HTTP ${res.status}`);
+  return (await res.json()) as GetConfigResponse;
+}
+
+/**
+ * Send a typing indicator to a WeChat user.
+ * status: 1 = typing (start/keepalive), 2 = cancel
+ * Requires typing_ticket from getConfig().
+ */
+export async function sendTyping(
+  baseUrl: string,
+  token: string,
+  ilinkUserId: string,
+  typingTicket: string,
+  status: 1 | 2,
+  fetchFn: typeof fetch = fetch,
+): Promise<void> {
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const body = JSON.stringify({
+    ilink_user_id: ilinkUserId,
+    typing_ticket: typingTicket,
+    status,
+    base_info: {},
+  });
+  try {
+    await fetchFn(`${base}ilink/bot/sendtyping`, {
+      method: "POST",
+      headers: buildHeaders(token, body),
+      body,
+    });
+  } catch {
+    // swallow errors — typing failures must not interrupt the main flow
+  }
+}
