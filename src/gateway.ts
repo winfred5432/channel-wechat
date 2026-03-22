@@ -315,7 +315,6 @@ export class Gateway {
                 payload.text ?? "",
                 state.contextToken,
                 fetchFn,
-                undefined,
                 { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext },
               );
             } catch (err) {

@@ -228,6 +228,7 @@ export async function sendMessage(
           media: {
             encrypt_query_param: imageItem.encryptQueryParam,
             aes_key: imageItem.aesKeyBase64,
+            encrypt_type: 1,
           },
           mid_size: imageItem.midSize,
         },
