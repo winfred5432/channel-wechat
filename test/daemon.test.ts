@@ -48,16 +48,34 @@ describe("ingress", () => {
   });
 });
 
+/** Minimal OutboxRecord that satisfies outboxToOutbound */
+function makeOutboxRecord(id: string, sessionKey: string, text: string) {
+  return {
+    id,
+    created_at: new Date().toISOString(),
+    channel_kind: "wechat",
+    session_key: sessionKey,
+    payload: { text },
+    status: "pending" as const,
+    attempts: 0,
+    last_attempt_at: null,
+    last_error: null,
+  };
+}
+
 describe("pull", () => {
-  it("calls channel.pull and returns payloads", async () => {
-    const payloads = [{ sessionKey: "s", text: "hello", raw: {} }];
-    const fetchFn = makeFetch({ records: payloads, idle: false });
+  it("calls channel.pull and maps OutboxRecords to OutboundChannelPayloads", async () => {
+    const record = makeOutboxRecord("REC1", "wechat:u1", "hello");
+    const fetchFn = makeFetch({ records: [record], idle: false });
     const result = await pull(
       DAEMON_URL,
-      { session_key: "s", consumer_id: "channel-wechat" },
+      { session_key: "wechat:u1", consumer_id: "channel-wechat" },
       fetchFn,
     );
-    expect(result).toEqual(payloads);
+    expect(result).toHaveLength(1);
+    expect(result[0].sessionKey).toBe("wechat:u1");
+    expect(result[0].text).toBe("hello");
+    expect((result[0].raw as { id: string }).id).toBe("REC1");
     const req = extractRequest(fetchFn);
     expect(req.method).toBe("channel.pull");
   });
@@ -69,7 +87,7 @@ describe("pull", () => {
   });
 
   it("includes cursor and limit in params", async () => {
-    const fetchFn = makeFetch([]);
+    const fetchFn = makeFetch({ records: [], idle: true });
     await pull(
       DAEMON_URL,
       { session_key: "s", consumer_id: "cw", cursor: "C1", limit: 5 },

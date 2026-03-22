@@ -4,6 +4,7 @@ import type {
   ChannelAckParams,
   OutboundChannelPayload,
 } from "@openduo/protocol";
+import { outboxToOutbound } from "@openduo/protocol";
 
 type JsonRpcRequest = {
   jsonrpc: "2.0";
@@ -63,7 +64,8 @@ export async function ingress(
 }
 
 interface PullResult {
-  records: OutboundChannelPayload[];
+  // daemon returns raw OutboxRecord objects; we apply outboxToOutbound mapping
+  records: Parameters<typeof outboxToOutbound>[0][];
   idle?: boolean;
 }
 
@@ -74,7 +76,7 @@ export async function pull(
 ): Promise<OutboundChannelPayload[]> {
   const result = await rpc(daemonUrl, "channel.pull", params, fetchFn);
   const res = result as PullResult | null;
-  return res?.records ?? [];
+  return (res?.records ?? []).map(outboxToOutbound);
 }
 
 export async function ack(

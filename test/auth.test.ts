@@ -79,15 +79,18 @@ describe("Auth", () => {
       expect((fetchFn as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
 
-    it("triggers new QR login when saved token is expired", async () => {
+    it("reuses a token that has a legacy expiresAt field (TTL no longer enforced)", async () => {
+      // ilink bot tokens have an unknown but long TTL; we rely on -14 for expiry detection.
+      // Old credentials.json files may carry an expiresAt field — it must be ignored.
       await mkdir(stateDir, { recursive: true });
-      const creds = { token: "EXPIREDTOKEN", expiresAt: Date.now() - 1000 };
+      const creds = { token: "LEGACYTOKEN", expiresAt: Date.now() - 1000 };
       await writeFile(join(stateDir, "credentials.json"), JSON.stringify(creds));
 
-      const fetchFn = mockFetchImmediate("FRESHTOKEN");
+      const fetchFn = vi.fn() as unknown as typeof fetch;  // should not be called
       const auth = new Auth(stateDir, BASE, fetchFn, 0);
       const token = await auth.getToken();
-      expect(token).toBe("FRESHTOKEN");
+      expect(token).toBe("LEGACYTOKEN");
+      expect((fetchFn as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
   });
 
@@ -102,7 +105,7 @@ describe("Auth", () => {
       expect(fileStat.mode & 0o777).toBe(0o600);
     });
 
-    it("writes valid JSON to credentials.json", async () => {
+    it("writes valid JSON to credentials.json (no expiresAt field)", async () => {
       const fetchFn = mockFetchImmediate("T123");
       const auth = new Auth(stateDir, BASE, fetchFn, 0);
       await auth.getToken();
@@ -110,7 +113,8 @@ describe("Auth", () => {
       const raw = await readFile(join(stateDir, "credentials.json"), "utf-8");
       const data = JSON.parse(raw);
       expect(data.token).toBe("T123");
-      expect(data.expiresAt).toBeGreaterThan(Date.now());
+      // No TTL — ilink bot token lifetime is server-controlled, detected via -14 error
+      expect(data.expiresAt).toBeUndefined();
     });
   });
 
