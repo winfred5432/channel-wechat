@@ -1,6 +1,6 @@
 import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
-import { getUpdates, sendMessage, WechatApiError } from "./wechat.js";
+import { getUpdates, sendMessage, WechatApiError, type MessageState } from "./wechat.js";
 import { ingress, pull, ack } from "./daemon.js";
 
 const CONSUMER_ID = "channel-wechat";
@@ -190,7 +190,7 @@ export class Gateway {
               cursor: state.cursor || undefined,
               limit: PULL_LIMIT,
               wait_ms: PULL_WAIT_MS,
-              return_mask: ["final"],
+              return_mask: ["final", "stream"],
             },
             fetchFn,
           );
@@ -199,7 +199,20 @@ export class Gateway {
 
           for (const payload of payloads) {
             if (payload.text) {
-              log("info", `Sending reply to ${state.toUser}: ${payload.text.slice(0, 60)}`, this.config);
+              // Derive message_state from OutboxRecord.stream:
+              //   stream present + is_final=false → 1 (SENDING, typing indicator)
+              //   stream present + is_final=true  → 2 (FINISH)
+              //   no stream field                 → 2 (FINISH, non-streaming reply)
+              const raw = payload.raw as Record<string, unknown> | null;
+              const stream = raw?.stream as { is_final?: boolean } | undefined;
+              const messageState: MessageState =
+                stream !== undefined && stream.is_final === false ? 1 : 2;
+
+              log(
+                "info",
+                `Sending reply to ${state.toUser} state=${messageState}: ${payload.text.slice(0, 60)}`,
+                this.config,
+              );
               try {
                 await sendMessage(
                   this.config.apiBase,
@@ -208,6 +221,7 @@ export class Gateway {
                   payload.text,
                   state.contextToken,
                   fetchFn,
+                  messageState,
                 );
               } catch (err) {
                 if (err instanceof WechatApiError && err.errcode === -14) {

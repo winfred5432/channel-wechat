@@ -164,6 +164,13 @@ function generateClientId(): string {
   return `cc-wx-${Date.now()}-${randomBytes(4).toString("hex")}`;
 }
 
+/**
+ * message_state values in ilink bot protocol:
+ *   1 = SENDING  — streaming chunk, shows typing indicator in WeChat
+ *   2 = FINISH   — final message, typing indicator disappears
+ */
+export type MessageState = 1 | 2;
+
 export async function sendMessage(
   baseUrl: string,
   token: string,
@@ -171,6 +178,7 @@ export async function sendMessage(
   text: string,
   contextToken?: string,
   fetchFn: typeof fetch = fetch,
+  messageState: MessageState = 2,
 ): Promise<void> {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   for (const chunk of splitText(text)) {
@@ -178,8 +186,8 @@ export async function sendMessage(
       from_user_id: "",
       to_user_id: toUser,
       client_id: generateClientId(),
-      message_type: 2,   // BOT
-      message_state: 2,  // FINISH
+      message_type: 2,           // BOT
+      message_state: messageState,
       item_list: [{ type: 1, text_item: { text: chunk } }],
     };
     if (contextToken) msgBody.context_token = contextToken;
