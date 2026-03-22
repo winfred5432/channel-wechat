@@ -107,9 +107,17 @@ export class Auth {
   }
 
   invalidateToken(): void {
+    // Only clear the in-memory cache. Do NOT delete the credentials file.
+    // The file is the long-term persistent store — deleting it forces a QR re-scan
+    // on every restart, which is unacceptable. The next getToken() call will load
+    // from file; if the token is still expired the caller should trigger QR login.
     this.cached = null;
-    // Also remove the persisted credentials so next getToken() triggers QR login
-    unlink(this.credFile).catch(() => { /* ignore if already gone */ });
+  }
+
+  /** Force a fresh QR login, overwriting any saved credentials. */
+  async relogin(): Promise<string> {
+    this.cached = null;
+    return this.startQrLogin();
   }
 
   private async loadCredentials(): Promise<Credentials | null> {

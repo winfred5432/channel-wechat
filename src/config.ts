@@ -27,7 +27,7 @@ export function loadConfig(): Config {
     throw new Error("WECHAT_DM_POLICY=allowlist requires WECHAT_ALLOW_FROM to be set");
   }
 
-  const stateDirRaw = process.env.WECHAT_STATE_DIR ?? "~/.openduo/wechat-channel";
+  const stateDirRaw = process.env.WECHAT_STATE_DIR ?? "~/.aladuo/channel-wechat";
   const stateDir = stateDirRaw.startsWith("~")
     ? resolve(homedir(), stateDirRaw.slice(2))
     : resolve(stateDirRaw);
