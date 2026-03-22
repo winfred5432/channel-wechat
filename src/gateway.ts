@@ -7,7 +7,6 @@ import { downloadMedia } from "./media.js";
 import { ingress, pull, ack } from "./daemon.js";
 
 const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
-const WECHAT_CDN_BASE = "https://cdn.ilinkai.weixin.qq.com";
 
 const CONSUMER_ID = "channel-wechat";
 const PULL_WAIT_MS = 10_000;
@@ -121,7 +120,7 @@ export class Gateway {
             try {
               await mkdir(MEDIA_TMP_DIR, { recursive: true });
               const buf = await downloadMedia({
-                cdnBaseUrl: WECHAT_CDN_BASE,
+                cdnBaseUrl: this.config.cdnBase,
                 encryptQueryParam: media.encrypt_query_param,
                 aesKeyBase64: media.aes_key,
                 fetchFn,

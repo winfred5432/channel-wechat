@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 export interface Config {
   daemonUrl: string;
   apiBase: string;
+  cdnBase: string;
   dmPolicy: "open" | "allowlist";
   allowFrom: string[];
   stateDir: string;
@@ -39,6 +40,7 @@ export function loadConfig(): Config {
   return {
     daemonUrl: process.env.ALADUO_DAEMON_URL ?? "http://127.0.0.1:20233",
     apiBase: process.env.WECHAT_API_BASE ?? "https://ilinkai.weixin.qq.com",
+    cdnBase: process.env.WECHAT_CDN_BASE ?? "https://cdn.ilinkai.weixin.qq.com",
     dmPolicy,
     allowFrom,
     stateDir,

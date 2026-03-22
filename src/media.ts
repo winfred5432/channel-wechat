@@ -130,8 +130,7 @@ export async function uploadMedia(params: {
     base_info: { channel_version: "claude-code-1.0" },
   });
 
-  const { randomBytes: rb } = await import("node:crypto");
-  const uin = Buffer.from(String(rb(4).readUInt32BE(0))).toString("base64");
+  const uin = Buffer.from(String(randomBytes(4).readUInt32BE(0))).toString("base64");
 
   const uploadUrlRes = await fetchFn(`${apiBaseNorm}ilink/bot/getuploadurl`, {
     method: "POST",
