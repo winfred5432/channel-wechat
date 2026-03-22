@@ -33,10 +33,70 @@ interface FetchCall {
   body?: Record<string, unknown>;
 }
 
+type UrlPattern = string | RegExp;
+
 /**
- * Returns a fetchFn that serves the given responses in order.
- * After the last response is used, calls `onExhausted()` so the test can stop the gateway.
- * Subsequent calls return a never-resolving promise to prevent tight loops.
+ * URL-routed fetch mock. Each entry routes to a specific ilink/daemon endpoint.
+ *
+ * Responses are served by matching against the URL in order within each endpoint's queue.
+ * This prevents ingressLoop and pullLoop from competing for the same sequential mock.
+ *
+ * Special endpoints:
+ * - "getconfig" and "sendtyping" always return {ret:0} immediately (typing indicator).
+ * - Unmatched calls or exhausted queues suspend on the abort signal.
+ *
+ * onExhausted is called once all non-typing queues are drained.
+ */
+function makeFetchRouted(
+  routes: Array<{ match: UrlPattern; responses: Array<{ body: unknown }> }>,
+  onExhausted: () => void,
+): { fetchFn: typeof fetch; calls: FetchCall[] } {
+  const calls: FetchCall[] = [];
+  const queues = routes.map(r => ({ match: r.match, queue: [...r.responses] }));
+  let exhausted = false;
+
+  function checkExhausted() {
+    if (!exhausted && queues.every(q => q.queue.length === 0)) {
+      exhausted = true;
+      setImmediate(onExhausted);
+    }
+  }
+
+  const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+    calls.push({ url, body: opts?.body ? JSON.parse(opts.body as string) : undefined });
+
+    // Typing indicator: always return OK without touching queues
+    if (typeof url === "string" && (url.includes("getconfig") || url.includes("sendtyping"))) {
+      return { ok: true, status: 200, json: async () => ({ ret: 0 }), text: async () => '{"ret":0}' };
+    }
+
+    // Find matching route
+    for (const route of queues) {
+      const matched = typeof route.match === "string"
+        ? url.includes(route.match)
+        : route.match.test(url);
+      if (matched && route.queue.length > 0) {
+        const response = route.queue.shift()!;
+        checkExhausted();
+        const bodyStr = JSON.stringify(response.body);
+        return { ok: true, status: 200, json: async () => response.body, text: async () => bodyStr };
+      }
+    }
+
+    // No match or exhausted queue: suspend until abort
+    const signal = opts?.signal;
+    return new Promise<never>((_resolve, reject) => {
+      if (signal?.aborted) { reject(new DOMException("Aborted", "AbortError")); return; }
+      signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    });
+  }) as unknown as typeof fetch;
+
+  return { fetchFn, calls };
+}
+
+/**
+ * Simple sequential fetch mock for tests where only one fetch pattern is expected
+ * (e.g., ingressLoop-only tests that never reach pullLoop).
  */
 function makeFetchSequence(
   responses: Array<{ body: unknown }>,
@@ -48,6 +108,11 @@ function makeFetchSequence(
 
   const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
     calls.push({ url, body: opts?.body ? JSON.parse(opts.body as string) : undefined });
+
+    // Typing indicator: serve immediately without consuming the sequence
+    if (typeof url === "string" && (url.includes("getconfig") || url.includes("sendtyping"))) {
+      return { ok: true, status: 200, json: async () => ({ ret: 0 }), text: async () => '{"ret":0}' };
+    }
 
     if (idx < responses.length) {
       const response = responses[idx++];
@@ -84,6 +149,21 @@ function wechatMsg(opts: {
     message_type: opts.messageType ?? 1,
     item_list: opts.text ? [{ type: 1, text_item: { text: opts.text } }] : [],
     context_token: opts.contextToken,
+  };
+}
+
+/** Minimal OutboxRecord for pull responses (matches outboxToOutbound expectations) */
+function makeOutboxRecord(id: string, sessionKey: string, text: string) {
+  return {
+    id,
+    created_at: new Date().toISOString(),
+    channel_kind: "wechat",
+    session_key: sessionKey,
+    payload: { text },
+    status: "pending" as const,
+    attempts: 0,
+    last_attempt_at: null,
+    last_error: null,
   };
 }
 
@@ -200,24 +280,39 @@ describe("Gateway pull and send flow", () => {
     const auth = makeAuth();
 
     let gateway: Gateway;
-    const { fetchFn, calls } = makeFetchSequence(
+    // Use URL-routed mock to prevent ingressLoop and pullLoop from competing
+    // for the same sequential response queue.
+    const { fetchFn, calls } = makeFetchRouted(
       [
         {
-          body: {
-            ret: 0,
-            msgs: [wechatMsg({ fromUserId: "u1", text: "question", contextToken: "CTX1" })],
-            get_updates_buf: "S",
-          },
+          match: "getupdates",
+          responses: [
+            // First poll: message from u1
+            {
+              body: {
+                ret: 0,
+                msgs: [wechatMsg({ fromUserId: "u1", text: "question", contextToken: "CTX1" })],
+                get_updates_buf: "S",
+              },
+            },
+            // Subsequent polls: empty (suspends after this queue is exhausted)
+          ],
         },
-        { body: { jsonrpc: "2.0", id: 1, result: null } },  // ingress
         {
-          body: pullResult([
-            { session_key: "wechat:u1", text: "answer", raw: { id: "OBX1" } },
-          ]),
+          match: "/rpc",
+          responses: [
+            { body: { jsonrpc: "2.0", id: 1, result: null } },          // ingress
+            { body: pullResult([makeOutboxRecord("OBX1", "wechat:u1", "answer")]) }, // pull
+            { body: { jsonrpc: "2.0", id: 3, result: null } },          // ack
+            { body: pullResult([]) },                                     // next pull empty → stop
+          ],
         },
-        { body: { ret: 0 } },                                // sendmessage
-        { body: { jsonrpc: "2.0", id: 3, result: null } },  // ack
-        { body: pullResult([]) },                            // next pull (empty)
+        {
+          match: "sendmessage",
+          responses: [
+            { body: { ret: 0 } },  // sendmessage reply
+          ],
+        },
       ],
       () => gateway.stop(),
     );
@@ -287,29 +382,34 @@ describe("Gateway pull and send flow", () => {
       }],
     };
 
-    const { fetchFn, calls } = makeFetchSequence(
+    // Use URL-routed mock to avoid ingressLoop consuming ingress responses with getupdates calls.
+    // CDN download returns an ArrayBuffer (binary content); routed separately from JSON APIs.
+    const { fetchFn: routedFetch, calls } = makeFetchRouted(
       [
-        { body: { ret: 0, msgs: [imageMsg], get_updates_buf: "S" } },
-        // CDN download response (arraybuffer of 16 bytes — minimal valid AES block)
-        { body: {} },
+        {
+          match: "getupdates",
+          responses: [{ body: { ret: 0, msgs: [imageMsg], get_updates_buf: "S" } }],
+        },
+        {
+          match: "/rpc",
+          responses: [{ body: { jsonrpc: "2.0", id: 1, result: null } }],  // ingress
+        },
       ],
       () => gateway.stop(),
     );
 
-    // Override fetchFn to return ArrayBuffer for CDN download URL
-    const originalFetch = fetchFn as ReturnType<typeof vi.fn>;
-    let callIdx = 0;
-    const wrappedFetch = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
-      callIdx++;
-      // CDN download URL contains "download"
+    // Wrap to intercept CDN download and return binary ArrayBuffer.
+    // The ciphertext must have valid AES-128-ECB + PKCS7 padding so decryption succeeds.
+    // Encrypted with key=Buffer.from("0123456789abcdef"), plaintext="hello":
+    const validCiphertext = new Uint8Array([103, 76, 126, 243, 142, 120, 202, 189, 156, 236, 156, 18, 88, 35, 166, 57]);
+    const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
       if (typeof url === "string" && url.includes("download")) {
-        const buf = new Uint8Array(32).fill(0).buffer; // 32 bytes: valid AES-128-ECB block
-        return { ok: true, status: 200, arrayBuffer: async () => buf };
+        return { ok: true, status: 200, arrayBuffer: async () => validCiphertext.buffer.slice(0) };
       }
-      return originalFetch(url, opts);
+      return (routedFetch as ReturnType<typeof vi.fn>)(url, opts);
     }) as unknown as typeof fetch;
 
-    gateway = new Gateway(config, auth, wrappedFetch);
+    gateway = new Gateway(config, auth, fetchFn);
     await new Promise<void>((resolve) => {
       const orig = gateway.stop.bind(gateway);
       gateway.stop = () => { orig(); resolve(); };
@@ -332,17 +432,22 @@ describe("Gateway error recovery", () => {
     const auth = makeAuth();
 
     let gateway: Gateway;
-    let callCount = 0;
-    const fetchFn = vi.fn().mockImplementation(async () => {
-      callCount++;
-      if (callCount === 1) {
-        const b1 = JSON.stringify({ ret: -14, errmsg: "token invalid" });
-        return { ok: true, json: async () => JSON.parse(b1), text: async () => b1 };
-      }
-      setImmediate(() => gateway.stop());
-      const b2 = JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "" });
-      return { ok: true, json: async () => JSON.parse(b2), text: async () => b2 };
-    }) as unknown as typeof fetch;
+    // Use makeFetchRouted so subsequent getUpdates calls suspend on the abort signal
+    // rather than returning immediately in a tight loop.
+    const { fetchFn } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [
+            // First call: returns -14 to trigger invalidateToken
+            { body: { ret: -14, errmsg: "token invalid" } },
+            // Second call: empty response, triggers stop()
+            { body: { ret: 0, msgs: [], get_updates_buf: "" } },
+          ],
+        },
+      ],
+      () => gateway.stop(),
+    );
 
     gateway = new Gateway(config, auth, fetchFn);
     await new Promise<void>((resolve) => {

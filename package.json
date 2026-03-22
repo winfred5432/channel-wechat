@@ -4,7 +4,9 @@
   "type": "module",
   "description": "WeChat channel adapter for openduo",
   "main": "dist/index.js",
-  "bin": { "openduo-wechat": "./dist/index.js" },
+  "bin": {
+    "openduo-wechat": "./dist/index.js"
+  },
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:qrcode",
     "dev": "tsx src/index.ts",
@@ -22,7 +24,9 @@
     "@vitest/coverage-v8": "^2",
     "tsx": "^4",
     "typescript": "^5",
-    "vitest": "^2"
+    "vitest": "^2.1.9"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }

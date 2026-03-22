@@ -136,20 +136,21 @@ describe("Auth", () => {
   });
 
   describe("invalidateToken", () => {
-    it("clears cached token so next getToken reloads from disk", async () => {
+    it("clears cached token so next getToken re-authenticates", async () => {
       await mkdir(stateDir, { recursive: true });
       const creds = { token: "VALID_TOKEN", expiresAt: Date.now() + 60_000 };
       await writeFile(join(stateDir, "credentials.json"), JSON.stringify(creds));
 
-      // No fetchFn needed — loads from disk
-      const auth = new Auth(stateDir, BASE, undefined, 0);
+      // Load initial token from disk; provide fetchFn for the re-auth after invalidation
+      const auth = new Auth(stateDir, BASE, mockFetchImmediate("NEW_TOKEN"), 0);
       const token1 = await auth.getToken();
       expect(token1).toBe("VALID_TOKEN");
 
+      // Delete creds file first so invalidateToken's async unlink is a no-op (file already gone)
+      await rm(join(stateDir, "credentials.json"), { force: true });
       auth.invalidateToken();
-      const creds2 = { token: "NEW_TOKEN", expiresAt: Date.now() + 60_000 };
-      await writeFile(join(stateDir, "credentials.json"), JSON.stringify(creds2));
 
+      // Next getToken finds no file → triggers QR login → fetchFn returns NEW_TOKEN
       const token2 = await auth.getToken();
       expect(token2).toBe("NEW_TOKEN");
     });

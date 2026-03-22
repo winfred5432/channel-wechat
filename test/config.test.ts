@@ -35,7 +35,7 @@ describe("loadConfig", () => {
     expect(config.logLevel).toBe("info");
     expect(config.daemonUrl).toBe("http://127.0.0.1:20233");
     expect(config.apiBase).toBe("https://ilinkai.weixin.qq.com");
-    expect(config.stateDir).toContain(".openduo");
+    expect(config.stateDir).toContain(".aladuo");
   });
 
   it("resolves ~ in stateDir", () => {
