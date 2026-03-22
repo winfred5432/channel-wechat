@@ -3,13 +3,17 @@ import { randomBytes } from "node:crypto";
 export const WECHAT_BASE = "https://ilinkai.weixin.qq.com";
 export const CHUNK_SIZE = 4000;
 
+interface WechatMsgItem {
+  type: number;
+  text_item?: { text: string };
+}
+
 export interface WechatMsg {
-  msgid: string;
-  from: string;
-  to?: string;
-  content: string;
-  msg_type?: number;
-  create_time?: number;
+  message_id: number | string;
+  from_user_id: string;
+  to_user_id?: string;
+  message_type?: number;
+  item_list?: WechatMsgItem[];
   context_token?: string;
 }
 
@@ -156,6 +160,10 @@ export async function getUpdates(
   };
 }
 
+function generateClientId(): string {
+  return `cc-wx-${Date.now()}-${randomBytes(4).toString("hex")}`;
+}
+
 export async function sendMessage(
   baseUrl: string,
   token: string,
@@ -166,13 +174,19 @@ export async function sendMessage(
 ): Promise<void> {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   for (const chunk of splitText(text)) {
-    const payload: Record<string, unknown> = {
-      to_user: toUser,
-      msg_type: 1,
-      content: chunk,
+    const msgBody: Record<string, unknown> = {
+      from_user_id: "",
+      to_user_id: toUser,
+      client_id: generateClientId(),
+      message_type: 2,   // BOT
+      message_state: 2,  // FINISH
+      item_list: [{ type: 1, text_item: { text: chunk } }],
     };
-    if (contextToken) payload.context_token = contextToken;
-    const body = JSON.stringify(payload);
+    if (contextToken) msgBody.context_token = contextToken;
+    const body = JSON.stringify({
+      msg: msgBody,
+      base_info: { channel_version: "claude-code-1.0" },
+    });
     const res = await fetchFn(`${base}ilink/bot/sendmessage`, {
       method: "POST",
       headers: buildHeaders(token, body),

@@ -62,13 +62,19 @@ export async function ingress(
   await rpc(daemonUrl, "channel.ingress", params, fetchFn);
 }
 
+interface PullResult {
+  records: OutboundChannelPayload[];
+  idle?: boolean;
+}
+
 export async function pull(
   daemonUrl: string,
   params: ChannelPullParams,
   fetchFn: typeof fetch = fetch,
 ): Promise<OutboundChannelPayload[]> {
   const result = await rpc(daemonUrl, "channel.pull", params, fetchFn);
-  return (result as OutboundChannelPayload[]) ?? [];
+  const res = result as PullResult | null;
+  return res?.records ?? [];
 }
 
 export async function ack(

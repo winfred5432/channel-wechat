@@ -133,23 +133,23 @@ describe("getUpdates", () => {
 });
 
 describe("sendMessage", () => {
-  it("sends a single message for short text with to_user field", async () => {
+  it("sends a single message for short text with correct msg format", async () => {
     const fetchFn = makeFetch({ ret: 0 });
     await sendMessage(BASE, "TOKEN", "user1", "hello", undefined, fetchFn);
     expect(fetchFn).toHaveBeenCalledTimes(1);
     const [url, opts] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     expect(url).toContain("sendmessage");
     const body = JSON.parse(opts.body as string);
-    expect(body.to_user).toBe("user1");
-    expect(body.content).toBe("hello");
-    expect(body.context_token).toBeUndefined();
+    expect(body.msg.to_user_id).toBe("user1");
+    expect(body.msg.item_list[0].text_item.text).toBe("hello");
+    expect(body.msg.context_token).toBeUndefined();
   });
 
   it("includes context_token when provided", async () => {
     const fetchFn = makeFetch({ ret: 0 });
     await sendMessage(BASE, "TOKEN", "user1", "hi", "CTXTOKEN", fetchFn);
     const body = JSON.parse((fetchFn as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
-    expect(body.context_token).toBe("CTXTOKEN");
+    expect(body.msg.context_token).toBe("CTXTOKEN");
   });
 
   it("splits long text into multiple messages", async () => {

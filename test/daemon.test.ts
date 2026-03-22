@@ -51,7 +51,7 @@ describe("ingress", () => {
 describe("pull", () => {
   it("calls channel.pull and returns payloads", async () => {
     const payloads = [{ sessionKey: "s", text: "hello", raw: {} }];
-    const fetchFn = makeFetch(payloads);
+    const fetchFn = makeFetch({ records: payloads, idle: false });
     const result = await pull(
       DAEMON_URL,
       { session_key: "s", consumer_id: "channel-wechat" },

@@ -35,7 +35,7 @@ interface FetchCall {
 /**
  * Returns a fetchFn that serves the given responses in order.
  * After the last response is used, calls `onExhausted()` so the test can stop the gateway.
- * Subsequent calls return a terminal empty-updates response to prevent tight loops.
+ * Subsequent calls return a never-resolving promise to prevent tight loops.
  */
 function makeFetchSequence(
   responses: Array<{ body: unknown }>,
@@ -52,18 +52,43 @@ function makeFetchSequence(
       const response = responses[idx++];
       if (idx === responses.length && !exhausted) {
         exhausted = true;
-        // Schedule stop after this response resolves
         setImmediate(onExhausted);
       }
       const bodyStr = JSON.stringify(response.body);
       return { ok: true, status: 200, json: async () => response.body, text: async () => bodyStr };
     }
 
-    // Fallback: never-resolving promise to halt the loop without tight-looping
-    return new Promise(() => {});
+    // Fallback: suspend until the gateway is stopped (abort signal fires)
+    const signal = opts?.signal;
+    return new Promise<never>((_resolve, reject) => {
+      if (signal?.aborted) { reject(new DOMException("Aborted", "AbortError")); return; }
+      signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    });
   }) as unknown as typeof fetch;
 
   return { fetchFn, calls };
+}
+
+/** Build a WeChat getUpdates response with real message structure */
+function wechatMsg(opts: {
+  messageId?: string;
+  fromUserId?: string;
+  text?: string;
+  contextToken?: string;
+  messageType?: number;
+}) {
+  return {
+    message_id: opts.messageId ?? "1",
+    from_user_id: opts.fromUserId ?? "user1",
+    message_type: opts.messageType ?? 1,
+    item_list: opts.text ? [{ type: 1, text_item: { text: opts.text } }] : [],
+    context_token: opts.contextToken,
+  };
+}
+
+/** Build a daemon pull result with records wrapper */
+function pullResult(records: unknown[]) {
+  return { jsonrpc: "2.0", id: 1, result: { records, idle: records.length === 0 } };
 }
 
 describe("Gateway allowlist filtering", () => {
@@ -77,7 +102,7 @@ describe("Gateway allowlist filtering", () => {
         {
           body: {
             ret: 0,
-            msgs: [{ msgid: "1", from: "blocked-user", content: "hi" }],
+            msgs: [wechatMsg({ fromUserId: "blocked-user", text: "hi" })],
             get_updates_buf: "BUF2",
           },
         },
@@ -106,12 +131,12 @@ describe("Gateway allowlist filtering", () => {
         {
           body: {
             ret: 0,
-            msgs: [{ msgid: "1", from: "allowed-user", content: "hi" }],
+            msgs: [wechatMsg({ fromUserId: "allowed-user", text: "hi" })],
             get_updates_buf: "BUF2",
           },
         },
         { body: { jsonrpc: "2.0", id: 1, result: null } },   // ingress
-        { body: { jsonrpc: "2.0", id: 2, result: [] } },     // pull (empty)
+        { body: pullResult([]) },                             // pull (empty)
       ],
       () => gateway.stop(),
     );
@@ -141,12 +166,12 @@ describe("Gateway open policy", () => {
         {
           body: {
             ret: 0,
-            msgs: [{ msgid: "1", from: "random-user", content: "hello" }],
+            msgs: [wechatMsg({ fromUserId: "random-user", text: "hello" })],
             get_updates_buf: "S",
           },
         },
         { body: { jsonrpc: "2.0", id: 1, result: null } },  // ingress
-        { body: { jsonrpc: "2.0", id: 2, result: [] } },    // pull
+        { body: pullResult([]) },                            // pull
       ],
       () => gateway.stop(),
     );
@@ -179,21 +204,19 @@ describe("Gateway pull and send flow", () => {
         {
           body: {
             ret: 0,
-            msgs: [{ msgid: "m1", from: "u1", content: "question" }],
+            msgs: [wechatMsg({ fromUserId: "u1", text: "question", contextToken: "CTX1" })],
             get_updates_buf: "S",
           },
         },
         { body: { jsonrpc: "2.0", id: 1, result: null } },  // ingress
         {
-          body: {
-            jsonrpc: "2.0",
-            id: 2,
-            result: [{ sessionKey: "wechat:u1", text: "answer", raw: { outbox_id: "OBX1" } }],
-          },
+          body: pullResult([
+            { session_key: "wechat:u1", text: "answer", raw: { id: "OBX1" } },
+          ]),
         },
-        { body: { ret: 0 } },                                  // sendmessage
-        { body: { jsonrpc: "2.0", id: 3, result: null } },   // ack
-        { body: { jsonrpc: "2.0", id: 4, result: [] } },     // next pull (empty)
+        { body: { ret: 0 } },                                // sendmessage
+        { body: { jsonrpc: "2.0", id: 3, result: null } },  // ack
+        { body: pullResult([]) },                            // next pull (empty)
       ],
       () => gateway.stop(),
     );
@@ -207,8 +230,41 @@ describe("Gateway pull and send flow", () => {
 
     const sendCalls = calls.filter((c) => c.url.includes("sendmessage"));
     expect(sendCalls.length).toBeGreaterThanOrEqual(1);
-    expect(sendCalls[0].body?.to_user).toBe("u1");
-    expect(sendCalls[0].body?.content).toBe("answer");
+    // Verify correct ilink message format
+    expect(sendCalls[0].body?.msg).toMatchObject({
+      to_user_id: "u1",
+      item_list: [{ type: 1, text_item: { text: "answer" } }],
+      context_token: "CTX1",
+    });
+  });
+
+  it("skips non-text messages (no item_list text)", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+
+    let gateway: Gateway;
+    const { fetchFn, calls } = makeFetchSequence(
+      [
+        {
+          body: {
+            ret: 0,
+            msgs: [{ message_id: "1", from_user_id: "u1", message_type: 1, item_list: [{ type: 2 }] }],
+            get_updates_buf: "S",
+          },
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    gateway = new Gateway(config, auth, fetchFn);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const ingressCalls = calls.filter((c) => c.body?.method === "channel.ingress");
+    expect(ingressCalls).toHaveLength(0);
   });
 });
 
@@ -225,7 +281,6 @@ describe("Gateway error recovery", () => {
         const b1 = JSON.stringify({ ret: -14, errmsg: "token invalid" });
         return { ok: true, json: async () => JSON.parse(b1), text: async () => b1 };
       }
-      // Second call: succeed, then stop
       setImmediate(() => gateway.stop());
       const b2 = JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "" });
       return { ok: true, json: async () => JSON.parse(b2), text: async () => b2 };
