@@ -11,6 +11,7 @@ vi.mock("qrcode", () => ({
 const BASE_CONFIG: Config = {
   daemonUrl: "http://127.0.0.1:20233",
   apiBase: "https://ilinkai.weixin.qq.com",
+  cdnBase: "https://cdn.ilinkai.weixin.qq.com",
   dmPolicy: "open",
   allowFrom: [],
   stateDir: "/tmp/test-state",
@@ -238,7 +239,8 @@ describe("Gateway pull and send flow", () => {
     });
   });
 
-  it("skips non-text messages (no item_list text)", async () => {
+  it("skips messages with no text and no images", async () => {
+    // Regression: type:3 (non-text, non-image) message should be skipped entirely
     const config = { ...BASE_CONFIG };
     const auth = makeAuth();
 
@@ -248,7 +250,7 @@ describe("Gateway pull and send flow", () => {
         {
           body: {
             ret: 0,
-            msgs: [{ message_id: "1", from_user_id: "u1", message_type: 1, item_list: [{ type: 2 }] }],
+            msgs: [{ message_id: "1", from_user_id: "u1", message_type: 1, item_list: [{ type: 3 }] }],
             get_updates_buf: "S",
           },
         },
@@ -265,6 +267,62 @@ describe("Gateway pull and send flow", () => {
 
     const ingressCalls = calls.filter((c) => c.body?.method === "channel.ingress");
     expect(ingressCalls).toHaveLength(0);
+  });
+
+  it("ingresses image-only messages via attachments (regression: combinedText was not defined)", async () => {
+    // Regression test: image item (type:2) without text must still trigger ingress.
+    // Previously this crashed with "ReferenceError: combinedText is not defined".
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+
+    let gateway: Gateway;
+    const imageMsg = {
+      message_id: "img-1",
+      from_user_id: "u1",
+      message_type: 1,
+      context_token: "ctx",
+      item_list: [{
+        type: 2,
+        image_item: { media: { encrypt_query_param: "eqp=abc", aes_key: Buffer.from("0123456789abcdef").toString("base64") } },
+      }],
+    };
+
+    const { fetchFn, calls } = makeFetchSequence(
+      [
+        { body: { ret: 0, msgs: [imageMsg], get_updates_buf: "S" } },
+        // CDN download response (arraybuffer of 16 bytes — minimal valid AES block)
+        { body: {} },
+      ],
+      () => gateway.stop(),
+    );
+
+    // Override fetchFn to return ArrayBuffer for CDN download URL
+    const originalFetch = fetchFn as ReturnType<typeof vi.fn>;
+    let callIdx = 0;
+    const wrappedFetch = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+      callIdx++;
+      // CDN download URL contains "download"
+      if (typeof url === "string" && url.includes("download")) {
+        const buf = new Uint8Array(32).fill(0).buffer; // 32 bytes: valid AES-128-ECB block
+        return { ok: true, status: 200, arrayBuffer: async () => buf };
+      }
+      return originalFetch(url, opts);
+    }) as unknown as typeof fetch;
+
+    gateway = new Gateway(config, auth, wrappedFetch);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const ingressCalls = calls.filter((c) => c.body?.method === "channel.ingress");
+    // Must have called ingress (not crashed/skipped)
+    expect(ingressCalls.length).toBeGreaterThanOrEqual(1);
+    // text should be undefined (image-only), attachments should be present
+    const ingressBody = ingressCalls[0]?.body?.params as Record<string, unknown> | undefined;
+    expect(ingressBody?.session_key).toBe("wechat:u1");
+    expect(Array.isArray(ingressBody?.attachments)).toBe(true);
   });
 });
 
