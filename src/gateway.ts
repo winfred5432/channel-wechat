@@ -122,9 +122,9 @@ export class Gateway {
             .map(i => i.text_item!.text)
             .join("") ?? "";
 
-          // Extract quoted message context (ref_msg on a type:1 item)
+          // Extract quoted message context (ref_msg may appear on any item type)
           for (const item of msg.item_list ?? []) {
-            if (item.type === 1 && item.ref_msg) {
+            if (item.ref_msg) {
               const ref = item.ref_msg;
               const parts: string[] = [];
               if (ref.title) parts.push(ref.title);

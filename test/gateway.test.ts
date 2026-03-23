@@ -651,6 +651,85 @@ describe("Gateway quote (ref_msg) handling", () => {
   });
 });
 
+describe("Gateway voice+quote combination handling", () => {
+  // When a user sends a voice message that quotes a previous message,
+  // ref_msg appears on the type:3 voice item (not type:1).
+  const validCiphertext = new Uint8Array([103, 76, 126, 243, 142, 120, 202, 189, 156, 236, 156, 18, 88, 35, 166, 57]);
+
+  it("injects both <voice_transcript> and <quoted_message> when voice message quotes another", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+
+    const voiceQuoteMsg = {
+      message_id: "voice-quote-1",
+      from_user_id: "u1",
+      message_type: 1,
+      context_token: "ctx",
+      item_list: [{
+        type: 3,
+        voice_item: {
+          text: "那我用语音引用的这条消息可以看到吗",
+          media: {
+            encrypt_query_param: "eqp=abc",
+            aes_key: Buffer.from("0123456789abcdef").toString("base64"),
+          },
+        },
+        ref_msg: {
+          title: "Bob",
+          message_item: { type: 1, text_item: { text: "被引用的消息" } },
+        },
+      }],
+    };
+
+    let gateway: Gateway;
+    const { fetchFn: routedFetch, calls } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [{ body: { ret: 0, msgs: [voiceQuoteMsg], get_updates_buf: "S" } }],
+        },
+        {
+          match: "/rpc",
+          responses: [{ body: { jsonrpc: "2.0", id: 1, result: null } }],
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+      if (typeof url === "string" && url.includes("download")) {
+        return { ok: true, status: 200, arrayBuffer: async () => validCiphertext.buffer.slice(0) };
+      }
+      return (routedFetch as ReturnType<typeof vi.fn>)(url, opts);
+    }) as unknown as typeof fetch;
+
+    gateway = new Gateway(config, auth, fetchFn);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const ingressCalls = calls.filter((c) => c.body?.method === "channel.ingress");
+    expect(ingressCalls.length).toBeGreaterThanOrEqual(1);
+    const params = ingressCalls[0]?.body?.params as Record<string, unknown>;
+    expect(typeof params.text).toBe("string");
+    const text = params.text as string;
+    // Must contain voice_transcript tag
+    expect(text).toContain("<voice_transcript>");
+    expect(text).toContain("那我用语音引用的这条消息可以看到吗");
+    expect(text).toContain("</voice_transcript>");
+    // Must also contain quoted_message tag
+    expect(text).toContain("<quoted_message>");
+    expect(text).toContain("Bob");
+    expect(text).toContain("被引用的消息");
+    expect(text).toContain("</quoted_message>");
+    // SILK attachment must be present
+    expect(Array.isArray(params.attachments)).toBe(true);
+    expect((params.attachments as unknown[]).length).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe("Gateway error recovery", () => {
   it("re-authenticates on errcode -14", async () => {
     const config = { ...BASE_CONFIG };
