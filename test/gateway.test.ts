@@ -582,6 +582,75 @@ describe("Gateway voice message handling", () => {
   });
 });
 
+describe("Gateway quote (ref_msg) handling", () => {
+  function makeQuoteMsg(opts: { quotedTitle?: string; quotedText?: string; userText?: string }) {
+    return {
+      message_id: "quote-1",
+      from_user_id: "u1",
+      message_type: 1,
+      context_token: "ctx",
+      item_list: [{
+        type: 1,
+        text_item: { text: opts.userText ?? "这条是用户自己说的话" },
+        ref_msg: {
+          title: opts.quotedTitle ?? "发送者名字",
+          message_item: opts.quotedText
+            ? { type: 1, text_item: { text: opts.quotedText } }
+            : undefined,
+        },
+      }],
+    };
+  }
+
+  it("injects <quoted_message> tag before user text when ref_msg is present", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+
+    let gateway: Gateway;
+    const { fetchFn, calls } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [{
+            body: {
+              ret: 0,
+              msgs: [makeQuoteMsg({ quotedTitle: "Alice", quotedText: "原始消息内容", userText: "我的回复" })],
+              get_updates_buf: "S",
+            },
+          }],
+        },
+        {
+          match: "/rpc",
+          responses: [{ body: { jsonrpc: "2.0", id: 1, result: null } }], // ingress
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    gateway = new Gateway(config, auth, fetchFn);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const ingressCalls = calls.filter((c) => c.body?.method === "channel.ingress");
+    expect(ingressCalls.length).toBeGreaterThanOrEqual(1);
+    const params = ingressCalls[0]?.body?.params as Record<string, unknown>;
+    expect(typeof params.text).toBe("string");
+    const text = params.text as string;
+    // Must contain quoted_message tag
+    expect(text).toContain("<quoted_message>");
+    expect(text).toContain("Alice");
+    expect(text).toContain("原始消息内容");
+    expect(text).toContain("</quoted_message>");
+    // User's own text must follow
+    expect(text).toContain("我的回复");
+    // quoted_message must come before user text
+    expect(text.indexOf("<quoted_message>")).toBeLessThan(text.indexOf("我的回复"));
+  });
+});
+
 describe("Gateway error recovery", () => {
   it("re-authenticates on errcode -14", async () => {
     const config = { ...BASE_CONFIG };

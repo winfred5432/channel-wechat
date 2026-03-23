@@ -122,6 +122,22 @@ export class Gateway {
             .map(i => i.text_item!.text)
             .join("") ?? "";
 
+          // Extract quoted message context (ref_msg on a type:1 item)
+          for (const item of msg.item_list ?? []) {
+            if (item.type === 1 && item.ref_msg) {
+              const ref = item.ref_msg;
+              const parts: string[] = [];
+              if (ref.title) parts.push(ref.title);
+              if (ref.message_item?.text_item?.text) parts.push(ref.message_item.text_item.text);
+              if (parts.length > 0) {
+                const tag = `<quoted_message>\n${parts.join("\n")}\n</quoted_message>`;
+                text = text ? `${tag}\n${text}` : tag;
+                log("info", `Quoted message context: "${parts.join(" | ")}"`, this.config);
+              }
+              break; // at most one ref_msg per message
+            }
+          }
+
           // Download and save all media items (image/voice/file/video)
           await mkdir(MEDIA_TMP_DIR, { recursive: true });
           const attachments: Array<{ path: string; mime: string }> = [];

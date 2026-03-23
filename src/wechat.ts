@@ -39,6 +39,13 @@ export interface WechatMsgItem {
     video_size?: number;
     play_length?: number;
   };
+  /** Quoted/referenced message (present when user replies to a previous message) */
+  ref_msg?: {
+    /** Sender name or title of the quoted message */
+    title?: string;
+    /** The quoted message item (may contain text_item, image_item, etc.) */
+    message_item?: WechatMsgItem;
+  };
 }
 
 export interface WechatMsg {
