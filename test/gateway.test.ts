@@ -426,6 +426,121 @@ describe("Gateway pull and send flow", () => {
   });
 });
 
+describe("Gateway voice message handling", () => {
+  // Minimal valid AES-128-ECB ciphertext for key=Buffer.from("0123456789abcdef")
+  const validCiphertext = new Uint8Array([103, 76, 126, 243, 142, 120, 202, 189, 156, 236, 156, 18, 88, 35, 166, 57]);
+
+  function makeVoiceMsg(opts: { transcript?: string } = {}) {
+    return {
+      message_id: "voice-1",
+      from_user_id: "u1",
+      message_type: 1,
+      context_token: "ctx",
+      item_list: [{
+        type: 3,
+        voice_item: {
+          text: opts.transcript,
+          media: {
+            encrypt_query_param: "eqp=abc",
+            aes_key: Buffer.from("0123456789abcdef").toString("base64"),
+          },
+        },
+      }],
+    };
+  }
+
+  it("injects <voice_transcript> and SILK attachment when WeChat provides transcript", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+
+    let gateway: Gateway;
+    const { fetchFn: routedFetch, calls } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [{ body: { ret: 0, msgs: [makeVoiceMsg({ transcript: "你好世界" })], get_updates_buf: "S" } }],
+        },
+        {
+          match: "/rpc",
+          responses: [{ body: { jsonrpc: "2.0", id: 1, result: null } }], // ingress
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+      if (typeof url === "string" && url.includes("download")) {
+        return { ok: true, status: 200, arrayBuffer: async () => validCiphertext.buffer.slice(0) };
+      }
+      return (routedFetch as ReturnType<typeof vi.fn>)(url, opts);
+    }) as unknown as typeof fetch;
+
+    gateway = new Gateway(config, auth, fetchFn);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const ingressCalls = calls.filter((c) => c.body?.method === "channel.ingress");
+    expect(ingressCalls.length).toBeGreaterThanOrEqual(1);
+    const params = ingressCalls[0]?.body?.params as Record<string, unknown>;
+    // text must contain <voice_transcript> tag
+    expect(typeof params.text).toBe("string");
+    expect(params.text as string).toContain("<voice_transcript>");
+    expect(params.text as string).toContain("你好世界");
+    expect(params.text as string).toContain("</voice_transcript>");
+    // SILK file must also be present as attachment
+    expect(Array.isArray(params.attachments)).toBe(true);
+    expect((params.attachments as unknown[]).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("sends SILK attachment without transcript when voice_item has no text", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+
+    let gateway: Gateway;
+    const { fetchFn: routedFetch, calls } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [{ body: { ret: 0, msgs: [makeVoiceMsg()], get_updates_buf: "S" } }],
+        },
+        {
+          match: "/rpc",
+          responses: [{ body: { jsonrpc: "2.0", id: 1, result: null } }], // ingress
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+      if (typeof url === "string" && url.includes("download")) {
+        return { ok: true, status: 200, arrayBuffer: async () => validCiphertext.buffer.slice(0) };
+      }
+      return (routedFetch as ReturnType<typeof vi.fn>)(url, opts);
+    }) as unknown as typeof fetch;
+
+    gateway = new Gateway(config, auth, fetchFn);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const ingressCalls = calls.filter((c) => c.body?.method === "channel.ingress");
+    expect(ingressCalls.length).toBeGreaterThanOrEqual(1);
+    const params = ingressCalls[0]?.body?.params as Record<string, unknown>;
+    // No transcript in text (text may be undefined or not contain voice_transcript)
+    if (params.text) {
+      expect(params.text as string).not.toContain("<voice_transcript>");
+    }
+    // SILK attachment must still be present
+    expect(Array.isArray(params.attachments)).toBe(true);
+    expect((params.attachments as unknown[]).length).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe("Gateway error recovery", () => {
   it("re-authenticates on errcode -14", async () => {
     const config = { ...BASE_CONFIG };

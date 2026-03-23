@@ -10,6 +10,10 @@
  */
 
 import { spawn } from "node:child_process";
+import { writeFile, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 
 /** Sample rate used for WeChat voice messages. */
 export const VOICE_SAMPLE_RATE = 16000;
@@ -78,6 +82,101 @@ function toPcm(buf: Buffer): Promise<Buffer> {
 
     ff.stdin.write(buf);
     ff.stdin.end();
+  });
+}
+
+/**
+ * Transcribe a SILK audio buffer using whisper.
+ * SILK → ffmpeg → WAV → whisper → text
+ *
+ * @returns Transcribed text, or null if whisper fails.
+ */
+export async function transcribeSilk(buf: Buffer): Promise<string | null> {
+  const tmpWav = join(tmpdir(), `wechat-voice-${randomBytes(4).toString("hex")}.wav`);
+  try {
+    // Decode SILK to WAV via ffmpeg
+    const wav = await toWav(buf);
+    await writeFile(tmpWav, wav);
+
+    // Run whisper CLI
+    const text = await runWhisper(tmpWav);
+    return text || null;
+  } finally {
+    unlink(tmpWav).catch(() => {});
+  }
+}
+
+/**
+ * Use ffmpeg to decode SILK to WAV (16kHz mono).
+ */
+function toWav(buf: Buffer): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const ff = spawn("ffmpeg", [
+      "-v", "quiet",
+      "-i", "pipe:0",
+      "-f", "wav",
+      "-acodec", "pcm_s16le",
+      "-ar", String(VOICE_SAMPLE_RATE),
+      "-ac", "1",
+      "pipe:1",
+    ]);
+
+    const chunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+
+    ff.stdout.on("data", (d: Buffer) => chunks.push(d));
+    ff.stderr.on("data", (d: Buffer) => errChunks.push(d));
+
+    ff.on("close", (code) => {
+      if (code !== 0) {
+        const stderr = Buffer.concat(errChunks).toString("utf-8").slice(-500);
+        return reject(new Error(`ffmpeg (toWav) exited ${code}: ${stderr}`));
+      }
+      resolve(Buffer.concat(chunks));
+    });
+
+    ff.on("error", (err) => reject(new Error(`ffmpeg spawn failed: ${err.message}`)));
+
+    ff.stdin.write(buf);
+    ff.stdin.end();
+  });
+}
+
+/**
+ * Run whisper CLI on a WAV file and return the transcribed text.
+ */
+function runWhisper(wavPath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("whisper", [
+      wavPath,
+      "--model", "base",
+      "--language", "zh",
+      "--output_format", "txt",
+      "--output_dir", tmpdir(),
+      "--fp16", "False",
+    ]);
+
+    const errChunks: Buffer[] = [];
+    proc.stderr.on("data", (d: Buffer) => errChunks.push(d));
+
+    proc.on("close", async (code) => {
+      if (code !== 0) {
+        const stderr = Buffer.concat(errChunks).toString("utf-8").slice(-500);
+        return reject(new Error(`whisper exited ${code}: ${stderr}`));
+      }
+      // whisper writes <filename>.txt in output_dir
+      const txtPath = join(tmpdir(), wavPath.replace(/\\/g, "/").split("/").pop()!.replace(/\.wav$/, ".txt"));
+      try {
+        const { readFile } = await import("node:fs/promises");
+        const txt = await readFile(txtPath, "utf-8");
+        unlink(txtPath).catch(() => {});
+        resolve(txt.trim());
+      } catch {
+        resolve("");
+      }
+    });
+
+    proc.on("error", (err) => reject(new Error(`whisper spawn failed: ${err.message}`)));
   });
 }
 

@@ -6,7 +6,7 @@ import type { Auth } from "./auth.js";
 import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "./wechat.js";
 import { downloadMedia, uploadMedia, MEDIA_TYPE_IMAGE, MEDIA_TYPE_FILE, MEDIA_TYPE_VOICE } from "./media.js";
 import { ingress, subscribePull, fileDownload } from "./daemon.js";
-import { toSilk } from "./voice.js";
+import { toSilk, transcribeSilk } from "./voice.js";
 import { OutboxQueue } from "./outbox.js";
 
 const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
@@ -117,7 +117,7 @@ export class Gateway {
 
           log("debug", `raw item_list from ${msg.from_user_id}: ${JSON.stringify(msg.item_list)}`, this.config);
 
-          const text = msg.item_list
+          let text = msg.item_list
             ?.filter(i => i.type === 1 && i.text_item?.text)
             .map(i => i.text_item!.text)
             .join("") ?? "";
@@ -148,7 +148,7 @@ export class Gateway {
                 log("info", `Downloaded image → ${fpath} (${buf.length}B)`, this.config);
 
               } else if (item.type === 3 && item.voice_item?.media?.encrypt_query_param && item.voice_item.media.aes_key) {
-                // VOICE
+                // VOICE — always download SILK file + inject transcript into text
                 const v = item.voice_item;
                 const buf = await downloadMedia({
                   cdnBaseUrl: this.config.cdnBase,
@@ -156,11 +156,28 @@ export class Gateway {
                   aesKeyBase64: v.media!.aes_key!,
                   fetchFn,
                 });
-                // Silk format by default; transcode not available here, pass as-is
                 const fpath = `${MEDIA_TMP_DIR}/${Date.now()}-${randomBytes(4).toString("hex")}.silk`;
                 await writeFile(fpath, buf);
                 attachments.push({ path: fpath, mime: "audio/silk" });
                 log("info", `Downloaded voice → ${fpath} (${buf.length}B)`, this.config);
+
+                // Inject transcript into text: prefer WeChat's own transcription, fallback to Whisper
+                if (v.text) {
+                  const tag = `<voice_transcript>\n${v.text}\n</voice_transcript>`;
+                  text = text ? `${text}\n${tag}` : tag;
+                  log("info", `Voice transcription from WeChat: "${v.text}"`, this.config);
+                } else {
+                  try {
+                    const transcript = await transcribeSilk(buf);
+                    if (transcript) {
+                      const tag = `<voice_transcript>\n${transcript}\n</voice_transcript>`;
+                      text = text ? `${text}\n${tag}` : tag;
+                      log("info", `Whisper transcript: "${transcript}"`, this.config);
+                    }
+                  } catch (err) {
+                    log("warn", `Whisper failed, no transcript injected: ${err}`, this.config);
+                  }
+                }
 
               } else if (item.type === 4 && item.file_item?.media?.encrypt_query_param && item.file_item.media.aes_key) {
                 // FILE
