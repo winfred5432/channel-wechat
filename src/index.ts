@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { Auth } from "./auth.js";
 import { Gateway } from "./gateway.js";
+import { startHealthServer } from "./health.js";
+import { OutboxQueue } from "./outbox.js";
 
 const PIDFILE = "/tmp/channel-wechat.pid";
 
@@ -53,13 +56,25 @@ async function main() {
     process.exit(1);
   }
 
-  const gateway = new Gateway(config, auth);
+  const outbox = new OutboxQueue(join(config.stateDir, "outbox.jsonl"));
+  const gateway = new Gateway(config, auth, fetch, outbox);
   gateway.start();
+
+  const healthPort = parseInt(process.env.WECHAT_HEALTH_PORT ?? "8765", 10);
+  const healthState = { running: true, tokenObtainedAt: auth.tokenObtainedAt };
+  const healthServer = startHealthServer(healthState, healthPort);
+  // Keep tokenObtainedAt in sync as auth refreshes
+  const healthSyncInterval = setInterval(() => {
+    healthState.tokenObtainedAt = auth.tokenObtainedAt;
+  }, 60_000);
 
   // Graceful shutdown
   for (const sig of ["SIGINT", "SIGTERM"]) {
     process.on(sig, () => {
       console.log(`\n[INFO] [wechat-channel] Received ${sig}, shutting down…`);
+      healthState.running = false;
+      clearInterval(healthSyncInterval);
+      healthServer.close();
       gateway.stop();
       releaseLock();
       process.exit(0);

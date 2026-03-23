@@ -16,6 +16,12 @@ export class Auth {
   private readonly qrcodePng: string;
   private cached: Credentials | null = null;
 
+  /** Timestamp when current token was obtained. 0 = never. */
+  tokenObtainedAt = 0;
+
+  private static readonly PROACTIVE_REFRESH_MS = 12 * 60 * 60 * 1000; // 12h
+  private silentRefreshInProgress = false;
+
   constructor(
     private readonly stateDir: string,
     private readonly apiBase: string,
@@ -29,11 +35,20 @@ export class Auth {
 
   async getToken(): Promise<string> {
     if (this.cached) {
+      // 超过 12h 且没有刷新进行中 → 后台静默刷新
+      if (
+        this.tokenObtainedAt > 0 &&
+        Date.now() - this.tokenObtainedAt > Auth.PROACTIVE_REFRESH_MS &&
+        !this.silentRefreshInProgress
+      ) {
+        void this.silentRefresh();
+      }
       return this.cached.token;
     }
     const saved = await this.loadCredentials();
     if (saved) {
       this.cached = saved;
+      if (this.tokenObtainedAt === 0) this.tokenObtainedAt = Date.now();
       return saved.token;
     }
     return this.startQrLogin();
@@ -74,6 +89,7 @@ export class Auth {
         };
         await this.saveCredentials(creds);
         this.cached = creds;
+        this.tokenObtainedAt = Date.now();
 
         // Signal to agent: WeChat is connected
         const botId = result.botId ?? "unknown";
@@ -111,7 +127,21 @@ export class Auth {
     // getToken() call falls through to startQrLogin() instead of reloading the
     // same expired token from disk in an infinite -14 loop.
     this.cached = null;
+    this.tokenObtainedAt = 0;
     unlink(this.credFile).catch(() => { /* ignore if already gone */ });
+  }
+
+  private async silentRefresh(): Promise<void> {
+    this.silentRefreshInProgress = true;
+    try {
+      // iLink currently has no interactive-free token refresh API.
+      // Reset the timer to prevent repeated triggering on every getToken() call.
+      // Real refresh still happens via -14 error path in gateway.
+      // TODO: call a no-QR refresh API here when iLink provides one.
+      this.tokenObtainedAt = Date.now();
+    } finally {
+      this.silentRefreshInProgress = false;
+    }
   }
 
   /** Force a fresh QR login, overwriting any saved credentials. */

@@ -7,6 +7,7 @@ import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "
 import { downloadMedia, uploadMedia, MEDIA_TYPE_IMAGE, MEDIA_TYPE_FILE, MEDIA_TYPE_VOICE } from "./media.js";
 import { ingress, subscribePull, fileDownload } from "./daemon.js";
 import { toSilk } from "./voice.js";
+import { OutboxQueue } from "./outbox.js";
 
 const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
 
@@ -53,6 +54,7 @@ export class Gateway {
     private readonly config: Config,
     private readonly auth: Auth,
     private readonly fetchFn: typeof fetch = fetch,
+    private readonly outbox?: OutboxQueue,
   ) {}
 
   start(): void {
@@ -65,6 +67,7 @@ export class Gateway {
       fetch(url, { ...init, signal });
     void this.ingressLoop(abortableFetch);
     void this.pullLoop(abortableFetch);
+    if (this.outbox) void this.replayOutbox(abortableFetch);
   }
 
   stop(): void {
@@ -346,7 +349,7 @@ export class Gateway {
                 if (isAudio) {
                   // Transcode to SILK, then send as voice message (type:3)
                   const { silk, playtimeMs } = await toSilk(fileBuffer, att.mime);
-                  const uploaded = await uploadMedia({
+                  const uploaded = await this.withRetry(() => uploadMedia({
                     apiBase: this.config.apiBase,
                     cdnBase: this.config.cdnBase,
                     token,
@@ -354,8 +357,8 @@ export class Gateway {
                     toUserId: state.toUser,
                     mediaType: MEDIA_TYPE_VOICE,
                     fetchFn,
-                  });
-                  await sendMessage(
+                  }), "uploadMedia(voice)");
+                  await this.withRetry(() => sendMessage(
                     this.config.apiBase,
                     token,
                     state.toUser,
@@ -363,9 +366,9 @@ export class Gateway {
                     state.contextToken,
                     fetchFn,
                     { kind: "voice", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, playtimeMs } },
-                  );
+                  ), "sendMessage(voice)");
                 } else {
-                  const uploaded = await uploadMedia({
+                  const uploaded = await this.withRetry(() => uploadMedia({
                     apiBase: this.config.apiBase,
                     cdnBase: this.config.cdnBase,
                     token,
@@ -373,9 +376,9 @@ export class Gateway {
                     toUserId: state.toUser,
                     mediaType: isImage ? MEDIA_TYPE_IMAGE : MEDIA_TYPE_FILE,
                     fetchFn,
-                  });
+                  }), isImage ? "uploadMedia(image)" : "uploadMedia(file)");
                   const fileName = att.path.split("/").pop() ?? "file";
-                  await sendMessage(
+                  await this.withRetry(() => sendMessage(
                     this.config.apiBase,
                     token,
                     state.toUser,
@@ -385,7 +388,7 @@ export class Gateway {
                     isImage
                       ? { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext }
                       : { kind: "file", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, fileName, fileSize: uploaded.rawSize } },
-                  );
+                  ), isImage ? "sendMessage(image)" : "sendMessage(file)");
                 }
               } catch (err) {
                 if (err instanceof WechatApiError && err.errcode === -14) {
@@ -394,7 +397,7 @@ export class Gateway {
                 log("error", `sendAttachment failed to ${state.toUser}: ${String(err)}`, this.config);
                 // Fallback: send text only for the last attachment
                 if (isLast && payload.text) {
-                  await sendMessage(this.config.apiBase, token, state.toUser, payload.text, state.contextToken, fetchFn).catch(e =>
+                  await this.withRetry(() => sendMessage(this.config.apiBase, token, state.toUser, payload.text!, state.contextToken, fetchFn), "sendMessage(fallback)").catch(e =>
                     log("error", `sendMessage fallback failed: ${String(e)}`, this.config)
                   );
                 }
@@ -403,19 +406,29 @@ export class Gateway {
           } else if (payload.text) {
             log("info", `Sending reply to ${state.toUser}: ${payload.text.slice(0, 60)}`, this.config);
             try {
-              await sendMessage(
+              await this.withRetry(() => sendMessage(
                 this.config.apiBase,
                 token,
                 state.toUser,
-                payload.text,
+                payload.text!,
                 state.contextToken,
                 fetchFn,
-              );
+              ), "sendMessage(text)");
             } catch (err) {
               if (err instanceof WechatApiError && err.errcode === -14) {
                 this.auth.invalidateToken();
               }
               log("error", `sendMessage failed to ${state.toUser}: ${String(err)}`, this.config);
+              // Persist to outbox for later replay
+              if (this.outbox) {
+                await this.outbox.enqueue({
+                  sessionKey,
+                  toUser: state.toUser,
+                  contextToken: state.contextToken,
+                  text: payload.text!,
+                  attachments: [],
+                }).catch((e) => log("warn", `outbox.enqueue failed: ${String(e)}`, this.config));
+              }
             }
           }
 
@@ -514,6 +527,63 @@ export class Gateway {
       clearInterval(timer);
       void doSend(2);
     };
+  }
+
+  private async withRetry<T>(
+    fn: () => Promise<T>,
+    label: string,
+    opts: { maxAttempts?: number; baseMs?: number } = {},
+  ): Promise<T> {
+    const maxAttempts = opts.maxAttempts ?? 3;
+    const baseMs = opts.baseMs ?? 500;
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        if (err instanceof WechatApiError && [-14, 400, 403].includes(err.errcode)) {
+          throw err; // non-retryable (auth / client errors)
+        }
+        if (attempt < maxAttempts) {
+          const delay = baseMs * Math.pow(2, attempt - 1);
+          log("warn", `${label} attempt ${attempt}/${maxAttempts} failed, retry in ${delay}ms: ${String(err)}`, this.config);
+          await sleep(delay);
+        }
+      }
+    }
+    throw lastErr;
+  }
+
+  /**
+   * On startup, replay any pending outbox records that failed to send previously.
+   * Waits 5s to let the gateway fully connect before attempting delivery.
+   */
+  private async replayOutbox(fetchFn: typeof fetch): Promise<void> {
+    if (!this.outbox) return;
+    await sleep(5_000); // let pullLoop establish WS connections first
+    const pending = await this.outbox.getPending();
+    if (pending.length === 0) return;
+    log("info", `Replaying ${pending.length} outbox pending records`, this.config);
+    for (const record of pending) {
+      if (!this.running) break;
+      try {
+        const token = await this.auth.getToken();
+        await this.withRetry(() => sendMessage(
+          this.config.apiBase,
+          token,
+          record.toUser,
+          record.text,
+          record.contextToken,
+          fetchFn,
+        ), "outbox.replay");
+        await this.outbox.markSent(record.id);
+        log("info", `Outbox replayed ${record.id} to ${record.toUser}`, this.config);
+      } catch (err) {
+        await this.outbox.markFailed(record.id, String(err));
+        log("warn", `Outbox replay failed for ${record.id}: ${String(err)}`, this.config);
+      }
+    }
   }
 
   private isAllowed(userId: string): boolean {
