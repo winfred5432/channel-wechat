@@ -4,8 +4,9 @@ import { extname } from "node:path";
 import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
 import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "./wechat.js";
-import { downloadMedia, uploadMedia, MEDIA_TYPE_IMAGE, MEDIA_TYPE_FILE } from "./media.js";
+import { downloadMedia, uploadMedia, MEDIA_TYPE_IMAGE, MEDIA_TYPE_FILE, MEDIA_TYPE_VOICE } from "./media.js";
 import { ingress, subscribePull, fileDownload } from "./daemon.js";
+import { toSilk } from "./voice.js";
 
 const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
 
@@ -278,7 +279,9 @@ export class Gateway {
     // that never receives actual output (no real user sends from that key).
     // -----------------------------------------------------------------------
     const CAP_SENTINEL = "wechat:__cap_heartbeat__";
-    let capCleanup: (() => void) | null = null;
+    // eslint-disable-next-line prefer-const
+    let capCleanup: (() => void) | null;
+    capCleanup = null as (() => void) | null;
 
     const ensureCapHeartbeat = () => {
       if (capCleanup) return;
@@ -338,27 +341,52 @@ export class Gateway {
                 // and the channel/session may run on different machines.
                 const fileBuffer = await fileDownload(this.config.daemonUrl, att.path, fetchFn);
                 const isImage = att.mime.startsWith("image/");
-                const uploaded = await uploadMedia({
-                  apiBase: this.config.apiBase,
-                  cdnBase: this.config.cdnBase,
-                  token,
-                  filePath: fileBuffer,
-                  toUserId: state.toUser,
-                  mediaType: isImage ? MEDIA_TYPE_IMAGE : MEDIA_TYPE_FILE,
-                  fetchFn,
-                });
-                const fileName = att.path.split("/").pop() ?? "file";
-                await sendMessage(
-                  this.config.apiBase,
-                  token,
-                  state.toUser,
-                  textForThisItem,
-                  state.contextToken,
-                  fetchFn,
-                  isImage
-                    ? { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext }
-                    : { kind: "file", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, fileName, fileSize: uploaded.rawSize } },
-                );
+                const isAudio = att.mime.startsWith("audio/");
+
+                if (isAudio) {
+                  // Transcode to SILK, then send as voice message (type:3)
+                  const { silk, playtimeMs } = await toSilk(fileBuffer, att.mime);
+                  const uploaded = await uploadMedia({
+                    apiBase: this.config.apiBase,
+                    cdnBase: this.config.cdnBase,
+                    token,
+                    filePath: silk,
+                    toUserId: state.toUser,
+                    mediaType: MEDIA_TYPE_VOICE,
+                    fetchFn,
+                  });
+                  await sendMessage(
+                    this.config.apiBase,
+                    token,
+                    state.toUser,
+                    textForThisItem,
+                    state.contextToken,
+                    fetchFn,
+                    { kind: "voice", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, playtimeMs } },
+                  );
+                } else {
+                  const uploaded = await uploadMedia({
+                    apiBase: this.config.apiBase,
+                    cdnBase: this.config.cdnBase,
+                    token,
+                    filePath: fileBuffer,
+                    toUserId: state.toUser,
+                    mediaType: isImage ? MEDIA_TYPE_IMAGE : MEDIA_TYPE_FILE,
+                    fetchFn,
+                  });
+                  const fileName = att.path.split("/").pop() ?? "file";
+                  await sendMessage(
+                    this.config.apiBase,
+                    token,
+                    state.toUser,
+                    textForThisItem,
+                    state.contextToken,
+                    fetchFn,
+                    isImage
+                      ? { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext }
+                      : { kind: "file", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, fileName, fileSize: uploaded.rawSize } },
+                  );
+                }
               } catch (err) {
                 if (err instanceof WechatApiError && err.errcode === -14) {
                   this.auth.invalidateToken();
@@ -442,8 +470,9 @@ export class Gateway {
     }
 
     // Shut down all connections on stop
-    capCleanup?.();
+    const finalCapCleanup = capCleanup;
     capCleanup = null;
+    finalCapCleanup?.();
     for (const cleanup of wsCleanups.values()) {
       cleanup();
     }

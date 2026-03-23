@@ -210,6 +210,17 @@ export interface FileItem {
   fileSize: number;  // plaintext size in bytes
 }
 
+export interface VoiceItem {
+  encryptQueryParam: string;
+  aesKeyBase64: string;
+  /** encode_type=6 (SILK v3) */
+  encodeType?: number;
+  sampleRate?: number;
+  bitsPerSample?: number;
+  /** Duration in milliseconds */
+  playtimeMs?: number;
+}
+
 export async function sendMessage(
   baseUrl: string,
   token: string,
@@ -217,7 +228,7 @@ export async function sendMessage(
   text: string,
   contextToken?: string,
   fetchFn: typeof fetch = fetch,
-  mediaItem?: ImageItem | { kind: "file"; item: FileItem },
+  mediaItem?: ImageItem | { kind: "file"; item: FileItem } | { kind: "voice"; item: VoiceItem },
 ): Promise<void> {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 
@@ -237,6 +248,23 @@ export async function sendMessage(
           file_name: f.fileName,
           md5: "",
           len: String(f.fileSize),
+        },
+      }];
+    } else if ("kind" in mediaItem && mediaItem.kind === "voice") {
+      // Send voice message (type:3 VOICE, SILK v3)
+      const v = mediaItem.item;
+      itemList = [{
+        type: 3,
+        voice_item: {
+          media: {
+            encrypt_query_param: v.encryptQueryParam,
+            aes_key: v.aesKeyBase64,
+            encrypt_type: 1,
+          },
+          encode_type: v.encodeType ?? 6,       // 6 = SILK v3
+          sample_rate: v.sampleRate ?? 16000,
+          bits_per_sample: v.bitsPerSample ?? 16,
+          playtime: v.playtimeMs ?? 0,
         },
       }];
     } else {

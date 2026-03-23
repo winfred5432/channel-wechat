@@ -104,6 +104,7 @@ interface GetUploadUrlResponse {
 /** media_type values from UploadMediaType: 1=IMAGE, 2=VIDEO, 3=FILE, 4=VOICE */
 export const MEDIA_TYPE_IMAGE = 1;
 export const MEDIA_TYPE_FILE = 3;
+export const MEDIA_TYPE_VOICE = 4;
 
 export async function uploadMedia(params: {
   apiBase: string;
