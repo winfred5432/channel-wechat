@@ -77,6 +77,8 @@ export interface UploadedMedia {
   aesKeyBase64: string;
   /** AES-128-ECB ciphertext size; use for image_item.mid_size / hd_size */
   fileSizeCiphertext: number;
+  /** Plaintext file size in bytes; use for file_item.len */
+  rawSize: number;
 }
 
 interface GetUploadUrlResponse {
@@ -99,6 +101,10 @@ interface GetUploadUrlResponse {
  *   5. POST encrypted bytes to CDN upload URL
  *   6. Return UploadedMedia for use in sendMessage image_item
  */
+/** media_type values from UploadMediaType: 1=IMAGE, 2=VIDEO, 3=FILE, 4=VOICE */
+export const MEDIA_TYPE_IMAGE = 1;
+export const MEDIA_TYPE_FILE = 3;
+
 export async function uploadMedia(params: {
   apiBase: string;
   cdnBase: string;
@@ -106,9 +112,10 @@ export async function uploadMedia(params: {
   /** Either a filesystem path or a pre-loaded Buffer */
   filePath: string | Buffer;
   toUserId: string;
+  mediaType?: number;  // default: MEDIA_TYPE_IMAGE (1)
   fetchFn?: typeof fetch;
 }): Promise<UploadedMedia> {
-  const { apiBase, cdnBase, token, filePath, toUserId, fetchFn = fetch } = params;
+  const { apiBase, cdnBase, token, filePath, toUserId, mediaType = MEDIA_TYPE_IMAGE, fetchFn = fetch } = params;
 
   const plaintext = Buffer.isBuffer(filePath) ? filePath : await readFile(filePath);
   const rawsize = plaintext.length;
@@ -121,7 +128,7 @@ export async function uploadMedia(params: {
   const apiBaseNorm = apiBase.endsWith("/") ? apiBase : `${apiBase}/`;
   const reqBody = JSON.stringify({
     filekey,
-    media_type: 1,
+    media_type: mediaType,
     to_user_id: toUserId,
     rawsize,
     rawfilemd5,
@@ -187,5 +194,6 @@ export async function uploadMedia(params: {
     encryptQueryParam,
     aesKeyBase64,
     fileSizeCiphertext: filesize,
+    rawSize: rawsize,
   };
 }

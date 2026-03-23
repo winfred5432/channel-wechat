@@ -203,6 +203,13 @@ export interface ImageItem {
   midSize: number;
 }
 
+export interface FileItem {
+  encryptQueryParam: string;
+  aesKeyBase64: string;
+  fileName: string;
+  fileSize: number;  // plaintext size in bytes
+}
+
 export async function sendMessage(
   baseUrl: string,
   token: string,
@@ -210,29 +217,51 @@ export async function sendMessage(
   text: string,
   contextToken?: string,
   fetchFn: typeof fetch = fetch,
-  imageItem?: ImageItem,
+  mediaItem?: ImageItem | { kind: "file"; item: FileItem },
 ): Promise<void> {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 
-  if (imageItem) {
-    // Send image message (type:2 IMAGE)
+  if (mediaItem) {
+    let itemList: unknown[];
+    if ("kind" in mediaItem && mediaItem.kind === "file") {
+      // Send file message (type:4 FILE)
+      const f = mediaItem.item;
+      itemList = [{
+        type: 4,
+        file_item: {
+          media: {
+            encrypt_query_param: f.encryptQueryParam,
+            aes_key: f.aesKeyBase64,
+            encrypt_type: 1,
+          },
+          file_name: f.fileName,
+          md5: "",
+          len: String(f.fileSize),
+        },
+      }];
+    } else {
+      // Send image message (type:2 IMAGE)
+      const img = mediaItem as ImageItem;
+      itemList = [{
+        type: 2,
+        image_item: {
+          media: {
+            encrypt_query_param: img.encryptQueryParam,
+            aes_key: img.aesKeyBase64,
+            encrypt_type: 1,
+          },
+          mid_size: img.midSize,
+        },
+      }];
+    }
+
     const msgBody: Record<string, unknown> = {
       from_user_id: "",
       to_user_id: toUser,
       client_id: generateClientId(),
       message_type: 2,
       message_state: 2,
-      item_list: [{
-        type: 2,
-        image_item: {
-          media: {
-            encrypt_query_param: imageItem.encryptQueryParam,
-            aes_key: imageItem.aesKeyBase64,
-            encrypt_type: 1,
-          },
-          mid_size: imageItem.midSize,
-        },
-      }],
+      item_list: itemList,
     };
     if (contextToken) msgBody.context_token = contextToken;
     const body = JSON.stringify({
