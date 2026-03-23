@@ -107,11 +107,11 @@ export class Auth {
   }
 
   invalidateToken(): void {
-    // Only clear the in-memory cache. Do NOT delete the credentials file.
-    // The file is the long-term persistent store — deleting it forces a QR re-scan
-    // on every restart, which is unacceptable. The next getToken() call will load
-    // from file; if the token is still expired the caller should trigger QR login.
+    // Clear in-memory cache AND delete the credentials file so that the next
+    // getToken() call falls through to startQrLogin() instead of reloading the
+    // same expired token from disk in an infinite -14 loop.
     this.cached = null;
+    unlink(this.credFile).catch(() => { /* ignore if already gone */ });
   }
 
   /** Force a fresh QR login, overwriting any saved credentials. */

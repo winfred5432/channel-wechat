@@ -4,7 +4,7 @@ import { extname } from "node:path";
 import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
 import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "./wechat.js";
-import { downloadMedia, uploadMedia } from "./media.js";
+import { downloadMedia, uploadMedia, MEDIA_TYPE_IMAGE, MEDIA_TYPE_FILE } from "./media.js";
 import { ingress, subscribePull, fileDownload } from "./daemon.js";
 
 const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
@@ -271,6 +271,36 @@ export class Gateway {
   private async pullLoop(fetchFn: typeof fetch): Promise<void> {
     log("info", "pullLoop started (WebSocket mode)", this.config);
 
+    // -----------------------------------------------------------------------
+    // Capability heartbeat WS — registers channel_capabilities immediately on
+    // startup so the daemon knows this channel accepts attachments, without
+    // waiting for a real user session to appear.  Uses a sentinel session key
+    // that never receives actual output (no real user sends from that key).
+    // -----------------------------------------------------------------------
+    const CAP_SENTINEL = "wechat:__cap_heartbeat__";
+    let capCleanup: (() => void) | null = null;
+
+    const ensureCapHeartbeat = () => {
+      if (capCleanup) return;
+      log("debug", "Registering capability heartbeat WS", this.config);
+      capCleanup = subscribePull({
+        daemonUrl: this.config.daemonUrl,
+        sessionKey: CAP_SENTINEL,
+        consumerId: CONSUMER_ID,
+        sourceKind: "wechat",
+        onOutput: async () => { /* sentinel session never receives real output */ },
+        onAck: () => {},
+        onError: () => {},
+        onClose: () => {
+          capCleanup = null;
+          if (!this.running) return;
+          // Reconnect after a short delay to keep capabilities registered
+          setTimeout(ensureCapHeartbeat, WS_RECONNECT_MS);
+        },
+      });
+    };
+    ensureCapHeartbeat();
+
     // sessionKey → WS cleanup function
     const wsCleanups = new Map<string, () => void>();
     // Per-session consecutive error count
@@ -307,14 +337,17 @@ export class Gateway {
                 // Download attachment content via RPC — the path is daemon-internal
                 // and the channel/session may run on different machines.
                 const fileBuffer = await fileDownload(this.config.daemonUrl, att.path, fetchFn);
+                const isImage = att.mime.startsWith("image/");
                 const uploaded = await uploadMedia({
                   apiBase: this.config.apiBase,
                   cdnBase: this.config.cdnBase,
                   token,
                   filePath: fileBuffer,
                   toUserId: state.toUser,
+                  mediaType: isImage ? MEDIA_TYPE_IMAGE : MEDIA_TYPE_FILE,
                   fetchFn,
                 });
+                const fileName = att.path.split("/").pop() ?? "file";
                 await sendMessage(
                   this.config.apiBase,
                   token,
@@ -322,7 +355,9 @@ export class Gateway {
                   textForThisItem,
                   state.contextToken,
                   fetchFn,
-                  { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext },
+                  isImage
+                    ? { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext }
+                    : { kind: "file", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, fileName, fileSize: uploaded.rawSize } },
                 );
               } catch (err) {
                 if (err instanceof WechatApiError && err.errcode === -14) {
@@ -407,6 +442,8 @@ export class Gateway {
     }
 
     // Shut down all connections on stop
+    capCleanup?.();
+    capCleanup = null;
     for (const cleanup of wsCleanups.values()) {
       cleanup();
     }
