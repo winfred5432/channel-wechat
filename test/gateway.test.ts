@@ -8,6 +8,47 @@ vi.mock("qrcode", () => ({
   default: { toFile: vi.fn().mockResolvedValue(undefined) },
 }));
 
+// Mock subscribePull: no real WebSocket in tests.
+// For sessions matching a queued outbox record, fire onOutput then onAck immediately.
+// For all others (cap heartbeat, unknown sessions), fire onError+onClose silently.
+type SubscribePullParams = Parameters<typeof import("../src/daemon.js").subscribePull>[0];
+
+const _subscribePullOutputQueues = new Map<string, Array<import("@openduo/protocol").OutboundChannelPayload>>();
+
+/** Call this before starting a gateway to queue a payload for a specific sessionKey. */
+function queueWsOutput(sessionKey: string, payload: import("@openduo/protocol").OutboundChannelPayload) {
+  if (!_subscribePullOutputQueues.has(sessionKey)) _subscribePullOutputQueues.set(sessionKey, []);
+  _subscribePullOutputQueues.get(sessionKey)!.push(payload);
+}
+
+vi.mock("../src/daemon.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/daemon.js")>();
+  return {
+    ...actual,
+    subscribePull: (params: SubscribePullParams) => {
+      const queue = _subscribePullOutputQueues.get(params.sessionKey);
+      if (queue && queue.length > 0) {
+        // Drain queued payloads, then close cleanly
+        setTimeout(async () => {
+          while (queue.length > 0) {
+            const payload = queue.shift()!;
+            await params.onOutput(payload);
+            params.onAck("cursor-1");
+          }
+          params.onClose();
+        }, 0);
+      } else {
+        // No output queued: simulate WS unavailable
+        setTimeout(() => {
+          params.onError(new Error("WebSocket unavailable in test"));
+          params.onClose();
+        }, 0);
+      }
+      return () => {};
+    },
+  };
+});
+
 const BASE_CONFIG: Config = {
   daemonUrl: "http://127.0.0.1:20233",
   apiBase: "https://ilinkai.weixin.qq.com",
@@ -279,15 +320,20 @@ describe("Gateway pull and send flow", () => {
     const config = { ...BASE_CONFIG };
     const auth = makeAuth();
 
+    // Queue a WS output payload for session wechat:u1 before gateway starts
+    queueWsOutput("wechat:u1", {
+      session_key: "wechat:u1",
+      text: "answer",
+      attachments: [],
+      record_id: "OBX1",
+    });
+
     let gateway: Gateway;
-    // Use URL-routed mock to prevent ingressLoop and pullLoop from competing
-    // for the same sequential response queue.
     const { fetchFn, calls } = makeFetchRouted(
       [
         {
           match: "getupdates",
           responses: [
-            // First poll: message from u1
             {
               body: {
                 ret: 0,
@@ -295,16 +341,12 @@ describe("Gateway pull and send flow", () => {
                 get_updates_buf: "S",
               },
             },
-            // Subsequent polls: empty (suspends after this queue is exhausted)
           ],
         },
         {
           match: "/rpc",
           responses: [
-            { body: { jsonrpc: "2.0", id: 1, result: null } },          // ingress
-            { body: pullResult([makeOutboxRecord("OBX1", "wechat:u1", "answer")]) }, // pull
-            { body: { jsonrpc: "2.0", id: 3, result: null } },          // ack
-            { body: pullResult([]) },                                     // next pull empty → stop
+            { body: { jsonrpc: "2.0", id: 1, result: null } }, // ingress
           ],
         },
         {
@@ -326,7 +368,6 @@ describe("Gateway pull and send flow", () => {
 
     const sendCalls = calls.filter((c) => c.url.includes("sendmessage"));
     expect(sendCalls.length).toBeGreaterThanOrEqual(1);
-    // Verify correct ilink message format
     expect(sendCalls[0].body?.msg).toMatchObject({
       to_user_id: "u1",
       item_list: [{ type: 1, text_item: { text: "answer" } }],
