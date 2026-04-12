@@ -7,6 +7,7 @@ export const CHUNK_SIZE = 4000;
 export interface CDNMedia {
   encrypt_query_param?: string;
   aes_key?: string;
+  full_url?: string;
 }
 
 export interface WechatMsgItem {
@@ -64,11 +65,12 @@ interface QrCodeResponse {
 }
 
 interface QrStatusResponse {
-  status: "wait" | "scaned" | "confirmed" | "expired";
+  status: "wait" | "scaned" | "confirmed" | "expired" | "scaned_but_redirect";
   bot_token?: string;
   ilink_bot_id?: string;
   ilink_user_id?: string;
   baseurl?: string;
+  redirect_host?: string;
 }
 
 interface GetUpdatesResponse {
@@ -137,6 +139,7 @@ export async function pollQrStatus(
   botId?: string;
   userId?: string;
   resolvedBaseUrl?: string;
+  redirectHost?: string;
 }> {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   const url = `${base}ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`;
@@ -161,6 +164,7 @@ export async function pollQrStatus(
     botId: data.ilink_bot_id,
     userId: data.ilink_user_id,
     resolvedBaseUrl: data.baseurl,
+    redirectHost: data.redirect_host,
   };
 }
 
@@ -228,6 +232,12 @@ export interface VoiceItem {
   playtimeMs?: number;
 }
 
+export interface VideoItem {
+  encryptQueryParam: string;
+  aesKeyBase64: string;
+  videoSize: number;
+}
+
 export async function sendMessage(
   baseUrl: string,
   token: string,
@@ -235,7 +245,7 @@ export async function sendMessage(
   text: string,
   contextToken?: string,
   fetchFn: typeof fetch = fetch,
-  mediaItem?: ImageItem | { kind: "file"; item: FileItem } | { kind: "voice"; item: VoiceItem },
+  mediaItem?: ImageItem | { kind: "file"; item: FileItem } | { kind: "voice"; item: VoiceItem } | { kind: "video"; item: VideoItem },
 ): Promise<void> {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
 
@@ -272,6 +282,19 @@ export async function sendMessage(
           sample_rate: v.sampleRate ?? 16000,
           bits_per_sample: v.bitsPerSample ?? 16,
           playtime: v.playtimeMs ?? 0,
+        },
+      }];
+    } else if ("kind" in mediaItem && mediaItem.kind === "video") {
+      const v = mediaItem.item;
+      itemList = [{
+        type: 5,
+        video_item: {
+          media: {
+            encrypt_query_param: v.encryptQueryParam,
+            aes_key: v.aesKeyBase64,
+            encrypt_type: 1,
+          },
+          video_size: v.videoSize,
         },
       }];
     } else {
@@ -353,6 +376,7 @@ interface GetUploadUrlResponse {
   upload_param?: string;
   upload_url?: string;
   encrypt_query_param?: string;
+  upload_full_url?: string;
 }
 
 export async function getUploadUrl(params: {
@@ -366,7 +390,7 @@ export async function getUploadUrl(params: {
   filesize: number;
   aeskey: string;  // hex string
   fetchFn?: typeof fetch;
-}): Promise<{ upload_url?: string; upload_param?: string; encrypt_query_param?: string }> {
+}): Promise<{ upload_url?: string; upload_full_url?: string; upload_param?: string; encrypt_query_param?: string }> {
   const { baseUrl, token, fetchFn = fetch, ...rest } = params;
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   const body = JSON.stringify({
@@ -390,9 +414,10 @@ export async function getUploadUrl(params: {
   const code = data.ret ?? data.errcode ?? 0;
   if (code !== 0) throw new WechatApiError(code, data.errmsg ?? "unknown");
   return {
-    upload_url: data.upload_url,
+    upload_url: data.upload_url ?? data.upload_full_url,
     upload_param: data.upload_param,
     encrypt_query_param: data.encrypt_query_param,
+    upload_full_url: data.upload_full_url,
   };
 }
 

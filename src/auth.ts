@@ -6,6 +6,7 @@ import { getQrCode, pollQrStatus, WechatApiError } from "./wechat.js";
 interface Credentials {
   token: string;
   botId?: string;
+  apiBase?: string;
   // No expiresAt — ilink bot tokens have an unknown TTL (potentially days).
   // Token expiry is detected via -14 error responses, not a proactive timer.
 }
@@ -15,6 +16,7 @@ export class Auth {
   private readonly syncBufFile: string;
   private readonly qrcodePng: string;
   private cached: Credentials | null = null;
+  private apiBase: string;
 
   /** Timestamp when current token was obtained. 0 = never. */
   tokenObtainedAt = 0;
@@ -24,10 +26,11 @@ export class Auth {
 
   constructor(
     private readonly stateDir: string,
-    private readonly apiBase: string,
+    apiBase: string,
     private readonly fetchFn: typeof fetch = fetch,
     private readonly pollIntervalMs: number = 2000,
   ) {
+    this.apiBase = apiBase;
     this.credFile = resolve(stateDir, "credentials.json");
     this.syncBufFile = resolve(stateDir, "sync-buf.txt");
     this.qrcodePng = resolve(stateDir, "qrcode.png");
@@ -48,10 +51,15 @@ export class Auth {
     const saved = await this.loadCredentials();
     if (saved) {
       this.cached = saved;
+      if (saved.apiBase) this.apiBase = saved.apiBase;
       if (this.tokenObtainedAt === 0) this.tokenObtainedAt = Date.now();
       return saved.token;
     }
     return this.startQrLogin();
+  }
+
+  getApiBase(): string {
+    return this.apiBase;
   }
 
   async startQrLogin(): Promise<string> {
@@ -71,7 +79,7 @@ export class Auth {
     const deadline = Date.now() + 8 * 60 * 1000; // 8 min (matches reference impl)
     while (Date.now() < deadline) {
       await sleep(this.pollIntervalMs);
-      let result: { status: string; token?: string; botId?: string };
+      let result: Awaited<ReturnType<typeof pollQrStatus>>;
       try {
         result = await pollQrStatus(this.apiBase, qrcodeStr, this.fetchFn);
       } catch (err) {
@@ -83,9 +91,13 @@ export class Auth {
       }
 
       if (result.status === "confirmed" && result.token) {
+        if (result.resolvedBaseUrl) {
+          this.apiBase = result.resolvedBaseUrl;
+        }
         const creds: Credentials = {
           token: result.token,
           botId: result.botId,
+          apiBase: this.apiBase,
         };
         await this.saveCredentials(creds);
         this.cached = creds;
@@ -97,6 +109,10 @@ export class Auth {
 
         await this.cleanupQrPng();
         return creds.token;
+      }
+      if (result.status === "scaned_but_redirect" && result.redirectHost) {
+        this.apiBase = normalizeApiBase(result.redirectHost);
+        continue;
       }
       if (result.status === "expired") {
         await this.cleanupQrPng();
@@ -182,4 +198,9 @@ export class Auth {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeApiBase(host: string): string {
+  if (host.includes("://")) return host;
+  return `https://${host}`;
 }

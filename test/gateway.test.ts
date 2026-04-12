@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { rm, writeFile } from "node:fs/promises";
 import type { Config } from "../src/config.js";
 import type { Auth } from "../src/auth.js";
 import { Gateway } from "../src/gateway.js";
@@ -64,6 +67,7 @@ function makeAuth(token = "TOKEN", syncBuf = ""): Auth {
     getToken: vi.fn().mockResolvedValue(token),
     getSyncBuf: vi.fn().mockResolvedValue(syncBuf),
     saveSyncBuf: vi.fn().mockResolvedValue(undefined),
+    getApiBase: vi.fn().mockReturnValue(BASE_CONFIG.apiBase),
     invalidateToken: vi.fn(),
     startQrLogin: vi.fn().mockResolvedValue(token),
   } as unknown as Auth;
@@ -649,6 +653,67 @@ describe("Gateway quote (ref_msg) handling", () => {
     // quoted_message must come before user text
     expect(text.indexOf("<quoted_message>")).toBeLessThan(text.indexOf("我的回复"));
   });
+
+  it("downloads quoted image media when the current message only references it", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+
+    const quotedImageMsg = {
+      message_id: "quote-image-1",
+      from_user_id: "u1",
+      message_type: 1,
+      context_token: "ctx",
+      item_list: [{
+        type: 1,
+        text_item: { text: "帮我看这张图" },
+        ref_msg: {
+          title: "Alice",
+          message_item: {
+            type: 2,
+            image_item: {
+              media: { full_url: "https://cdn.example.com/quoted.jpg" },
+            },
+          },
+        },
+      }],
+    };
+
+    let gateway: Gateway;
+    const { fetchFn: routedFetch, calls } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [{ body: { ret: 0, msgs: [quotedImageMsg], get_updates_buf: "S" } }],
+        },
+        {
+          match: "/rpc",
+          responses: [{ body: { jsonrpc: "2.0", id: 1, result: null } }],
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    const jpegBytes = new Uint8Array([255, 216, 255, 217]);
+    const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+      if (typeof url === "string" && url === "https://cdn.example.com/quoted.jpg") {
+        return { ok: true, status: 200, arrayBuffer: async () => jpegBytes.buffer.slice(0) };
+      }
+      return (routedFetch as ReturnType<typeof vi.fn>)(url, opts);
+    }) as unknown as typeof fetch;
+
+    gateway = new Gateway(config, auth, fetchFn);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const ingressCalls = calls.filter((c) => c.body?.method === "channel.ingress");
+    expect(ingressCalls.length).toBeGreaterThanOrEqual(1);
+    const params = ingressCalls[0]?.body?.params as Record<string, unknown>;
+    expect(Array.isArray(params.attachments)).toBe(true);
+    expect((params.attachments as Array<{ mime: string }>)[0]?.mime).toBe("image/jpeg");
+  });
 });
 
 describe("Gateway voice+quote combination handling", () => {
@@ -761,5 +826,331 @@ describe("Gateway error recovery", () => {
     });
 
     expect((auth.invalidateToken as ReturnType<typeof vi.fn>)).toHaveBeenCalled();
+  });
+});
+
+describe("Gateway outbound media variants", () => {
+  it("uses Auth api base for polling and replies after a redirect login", async () => {
+    const redirectBase = "https://redirect.weixin.qq.com";
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+    (auth.getApiBase as ReturnType<typeof vi.fn>).mockReturnValue(redirectBase);
+
+    queueWsOutput("wechat:u1", {
+      session_key: "wechat:u1",
+      text: "answer",
+      attachments: [],
+      record_id: "OBX-REDIRECT",
+      raw: {},
+    } as import("@openduo/protocol").OutboundChannelPayload);
+
+    let gateway: Gateway;
+    const { fetchFn, calls } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [{ body: { ret: 0, msgs: [wechatMsg({ fromUserId: "u1", text: "question", contextToken: "CTX1" })], get_updates_buf: "S" } }],
+        },
+        {
+          match: "/rpc",
+          responses: [{ body: { jsonrpc: "2.0", id: 1, result: null } }],
+        },
+        {
+          match: "sendmessage",
+          responses: [{ body: { ret: 0 } }],
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    gateway = new Gateway(config, auth, fetchFn);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const getUpdatesCall = calls.find((c) => c.url.includes("getupdates"));
+    const sendCall = calls.find((c) => c.url.includes("sendmessage"));
+    expect(getUpdatesCall?.url.startsWith(`${redirectBase}/`)).toBe(true);
+    expect(sendCall?.url.startsWith(`${redirectBase}/`)).toBe(true);
+  });
+
+  it("sends video attachments as native video messages", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+
+    queueWsOutput("wechat:u1", {
+      session_key: "wechat:u1",
+      text: "video caption",
+      attachments: [{ path: "/daemon/video.mp4", mime: "video/mp4" }],
+      record_id: "OBX-VIDEO",
+      raw: {},
+    } as import("@openduo/protocol").OutboundChannelPayload);
+
+    let gateway: Gateway;
+    const { fetchFn: routedFetch, calls } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [{ body: { ret: 0, msgs: [wechatMsg({ fromUserId: "u1", text: "question", contextToken: "CTX1" })], get_updates_buf: "S" } }],
+        },
+        {
+          match: "/rpc",
+          responses: [
+            { body: { jsonrpc: "2.0", id: 1, result: null } }, // ingress
+            { body: { jsonrpc: "2.0", id: 2, result: { content_base64: Buffer.from("video-bytes").toString("base64") } } }, // file download
+          ],
+        },
+        {
+          match: "getuploadurl",
+          responses: [{ body: { ret: 0, upload_full_url: "https://upload.example.com/video" } }],
+        },
+        {
+          match: "sendmessage",
+          responses: [{ body: { ret: 0 } }, { body: { ret: 0 } }],
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+      if (typeof url === "string" && url === "https://upload.example.com/video") {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (name: string) => (name === "x-encrypted-param" ? "ENC_VIDEO" : null) },
+        };
+      }
+      return (routedFetch as ReturnType<typeof vi.fn>)(url, opts);
+    }) as unknown as typeof fetch;
+
+    gateway = new Gateway(config, auth, fetchFn);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const sendCalls = calls.filter((c) => c.url.includes("sendmessage"));
+    expect(sendCalls.length).toBeGreaterThanOrEqual(2);
+    expect(sendCalls[0].body?.msg.item_list[0].type).toBe(5);
+    expect(sendCalls[0].body?.msg.item_list[0].video_item.media.encrypt_query_param).toBe("ENC_VIDEO");
+  });
+
+  it("supports outbound mediaUrl from raw payload data", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+    const filePath = join(tmpdir(), `gateway-media-${Date.now()}.png`);
+    await writeFile(filePath, Buffer.from("png-data"));
+
+    queueWsOutput("wechat:u1", {
+      session_key: "wechat:u1",
+      text: "Look ![alt](https://example.com/hidden.png) **bold**",
+      attachments: [],
+      record_id: "OBX-MEDIAURL",
+      raw: {
+        payload: {
+          data: {
+            mediaUrl: filePath,
+          },
+        },
+      },
+    } as import("@openduo/protocol").OutboundChannelPayload);
+
+    let gateway: Gateway;
+    const { fetchFn: routedFetch, calls } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [{ body: { ret: 0, msgs: [wechatMsg({ fromUserId: "u1", text: "question", contextToken: "CTX1" })], get_updates_buf: "S" } }],
+        },
+        {
+          match: "/rpc",
+          responses: [{ body: { jsonrpc: "2.0", id: 1, result: null } }],
+        },
+        {
+          match: "getuploadurl",
+          responses: [{ body: { ret: 0, upload_full_url: "https://upload.example.com/image" } }],
+        },
+        {
+          match: "sendmessage",
+          responses: [{ body: { ret: 0 } }, { body: { ret: 0 } }],
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+      if (typeof url === "string" && url === "https://upload.example.com/image") {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (name: string) => (name === "x-encrypted-param" ? "ENC_IMAGE" : null) },
+        };
+      }
+      return (routedFetch as ReturnType<typeof vi.fn>)(url, opts);
+    }) as unknown as typeof fetch;
+
+    try {
+      gateway = new Gateway(config, auth, fetchFn);
+      await new Promise<void>((resolve) => {
+        const orig = gateway.stop.bind(gateway);
+        gateway.stop = () => { orig(); resolve(); };
+        gateway.start();
+      });
+    } finally {
+      await rm(filePath, { force: true });
+    }
+
+    const sendCalls = calls.filter((c) => c.url.includes("sendmessage"));
+    expect(sendCalls.length).toBeGreaterThanOrEqual(2);
+    expect(sendCalls[0].body?.msg.item_list[0].type).toBe(2);
+    expect(sendCalls[1].body?.msg.item_list[0].text_item.text).toBe("Look  **bold**");
+  });
+
+  it("uses remote media response content-type when the URL has no usable extension", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+
+    queueWsOutput("wechat:u1", {
+      session_key: "wechat:u1",
+      text: "caption",
+      attachments: [],
+      record_id: "OBX-REMOTE-IMAGE",
+      raw: {
+        payload: {
+          data: {
+            mediaUrl: "https://cdn.example.com/download?id=123",
+          },
+        },
+      },
+    } as import("@openduo/protocol").OutboundChannelPayload);
+
+    let gateway: Gateway;
+    const { fetchFn: routedFetch, calls } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [{ body: { ret: 0, msgs: [wechatMsg({ fromUserId: "u1", text: "question", contextToken: "CTX1" })], get_updates_buf: "S" } }],
+        },
+        {
+          match: "/rpc",
+          responses: [{ body: { jsonrpc: "2.0", id: 1, result: null } }],
+        },
+        {
+          match: "getuploadurl",
+          responses: [{ body: { ret: 0, upload_full_url: "https://upload.example.com/image" } }],
+        },
+        {
+          match: "sendmessage",
+          responses: [{ body: { ret: 0 } }, { body: { ret: 0 } }],
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+      if (typeof url === "string" && url === "https://cdn.example.com/download?id=123") {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (name: string) => (name.toLowerCase() === "content-type" ? "image/png" : null) },
+          arrayBuffer: async () => Buffer.from("png-data"),
+        };
+      }
+      if (typeof url === "string" && url === "https://upload.example.com/image") {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (name: string) => (name === "x-encrypted-param" ? "ENC_IMAGE" : null) },
+        };
+      }
+      return (routedFetch as ReturnType<typeof vi.fn>)(url, opts);
+    }) as unknown as typeof fetch;
+
+    gateway = new Gateway(config, auth, fetchFn);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const sendCalls = calls.filter((c) => c.url.includes("sendmessage"));
+    expect(sendCalls.length).toBeGreaterThanOrEqual(2);
+    expect(sendCalls[0].body?.msg.item_list[0].type).toBe(2);
+  });
+
+  it("preserves an inferred extension for remote file mediaUrls", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+
+    queueWsOutput("wechat:u1", {
+      session_key: "wechat:u1",
+      text: "file caption",
+      attachments: [],
+      record_id: "OBX-REMOTE-FILE",
+      raw: {
+        payload: {
+          data: {
+            mediaUrl: "https://cdn.example.com/download?id=456",
+          },
+        },
+      },
+    } as import("@openduo/protocol").OutboundChannelPayload);
+
+    let gateway: Gateway;
+    const { fetchFn: routedFetch, calls } = makeFetchRouted(
+      [
+        {
+          match: "getupdates",
+          responses: [{ body: { ret: 0, msgs: [wechatMsg({ fromUserId: "u1", text: "question", contextToken: "CTX1" })], get_updates_buf: "S" } }],
+        },
+        {
+          match: "/rpc",
+          responses: [{ body: { jsonrpc: "2.0", id: 1, result: null } }],
+        },
+        {
+          match: "getuploadurl",
+          responses: [{ body: { ret: 0, upload_full_url: "https://upload.example.com/file" } }],
+        },
+        {
+          match: "sendmessage",
+          responses: [{ body: { ret: 0 } }, { body: { ret: 0 } }],
+        },
+      ],
+      () => gateway.stop(),
+    );
+
+    const fetchFn = vi.fn().mockImplementation(async (url: string, opts?: RequestInit) => {
+      if (typeof url === "string" && url === "https://cdn.example.com/download?id=456") {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (name: string) => (name.toLowerCase() === "content-type" ? "application/pdf" : null) },
+          arrayBuffer: async () => Buffer.from("%PDF-1.7"),
+        };
+      }
+      if (typeof url === "string" && url === "https://upload.example.com/file") {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (name: string) => (name === "x-encrypted-param" ? "ENC_FILE" : null) },
+        };
+      }
+      return (routedFetch as ReturnType<typeof vi.fn>)(url, opts);
+    }) as unknown as typeof fetch;
+
+    gateway = new Gateway(config, auth, fetchFn);
+    await new Promise<void>((resolve) => {
+      const orig = gateway.stop.bind(gateway);
+      gateway.stop = () => { orig(); resolve(); };
+      gateway.start();
+    });
+
+    const sendCalls = calls.filter((c) => c.url.includes("sendmessage"));
+    expect(sendCalls.length).toBeGreaterThanOrEqual(2);
+    expect(sendCalls[0].body?.msg.item_list[0].type).toBe(4);
+    expect(sendCalls[0].body?.msg.item_list[0].file_item.file_name).toBe("download.pdf");
   });
 });

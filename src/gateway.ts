@@ -1,13 +1,15 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import { extname } from "node:path";
+import { extname, basename, resolve as resolvePath } from "node:path";
 import type { Config } from "./config.js";
 import type { Auth } from "./auth.js";
 import { getUpdates, sendMessage, getConfig, sendTyping, WechatApiError } from "./wechat.js";
-import { downloadMedia, uploadMedia, MEDIA_TYPE_IMAGE, MEDIA_TYPE_FILE, MEDIA_TYPE_VOICE } from "./media.js";
+import type { WechatMsgItem } from "./wechat.js";
+import { downloadMedia, uploadMedia, MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, MEDIA_TYPE_FILE, MEDIA_TYPE_VOICE } from "./media.js";
 import { ingress, subscribePull, fileDownload } from "./daemon.js";
 import { toSilk, transcribeSilk } from "./voice.js";
 import { OutboxQueue } from "./outbox.js";
+import { StreamingMarkdownFilter } from "./markdown-filter.js";
 
 const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
 
@@ -23,6 +25,67 @@ function log(level: string, msg: string, cfg?: Config) {
   if (levels.indexOf(level) <= levels.indexOf(cfgLevel)) {
     console.log(`[${level.toUpperCase()}] [wechat-channel] ${msg}`);
   }
+}
+
+function extractReferencedText(item?: WechatMsgItem): string {
+  if (!item) return "";
+  if (item.text_item?.text) return item.text_item.text;
+  if (item.voice_item?.text) return item.voice_item.text;
+  if (item.file_item?.file_name) return item.file_item.file_name;
+  return "";
+}
+
+function hasDownloadableMedia(item?: WechatMsgItem): boolean {
+  return Boolean(
+    item && (
+      item.image_item?.media?.encrypt_query_param ||
+      item.image_item?.media?.full_url ||
+      item.voice_item?.media?.encrypt_query_param ||
+      item.voice_item?.media?.full_url ||
+      item.file_item?.media?.encrypt_query_param ||
+      item.file_item?.media?.full_url ||
+      item.video_item?.media?.encrypt_query_param ||
+      item.video_item?.media?.full_url
+    ),
+  );
+}
+
+function findQuotedMediaItem(items?: WechatMsgItem[]): WechatMsgItem | undefined {
+  for (const item of items ?? []) {
+    if (hasDownloadableMedia(item)) return undefined;
+  }
+  for (const item of items ?? []) {
+    if (item.ref_msg?.message_item && hasDownloadableMedia(item.ref_msg.message_item)) {
+      return item.ref_msg.message_item;
+    }
+  }
+  return undefined;
+}
+
+function getOutboundMediaUrls(payload: { raw?: unknown }): string[] {
+  const raw = payload.raw as { payload?: { data?: Record<string, unknown> } } | undefined;
+  const data = raw?.payload?.data;
+  if (!data) return [];
+
+  const urls: string[] = [];
+  if (typeof data.mediaUrl === "string" && data.mediaUrl.trim()) {
+    urls.push(data.mediaUrl.trim());
+  }
+  if (Array.isArray(data.mediaUrls)) {
+    for (const value of data.mediaUrls) {
+      if (typeof value === "string" && value.trim()) {
+        urls.push(value.trim());
+      }
+    }
+  }
+  return urls;
+}
+
+function resolveMediaPath(mediaUrl: string): string | undefined {
+  if (!mediaUrl) return undefined;
+  if (mediaUrl.startsWith("file://")) return new URL(mediaUrl).pathname;
+  if (!mediaUrl.includes("://")) return resolvePath(mediaUrl);
+  return undefined;
 }
 
 export class Gateway {
@@ -91,9 +154,10 @@ export class Gateway {
       try {
         const token = await this.auth.getToken();
         const syncBuf = await this.auth.getSyncBuf();
+        const apiBase = this.auth.getApiBase();
 
         const { msgs, syncBuf: newSyncBuf } = await getUpdates(
-          this.config.apiBase,
+          apiBase,
           token,
           syncBuf,
           fetchFn,
@@ -128,7 +192,8 @@ export class Gateway {
               const ref = item.ref_msg;
               const parts: string[] = [];
               if (ref.title) parts.push(ref.title);
-              if (ref.message_item?.text_item?.text) parts.push(ref.message_item.text_item.text);
+              const refText = extractReferencedText(ref.message_item);
+              if (refText) parts.push(refText);
               if (parts.length > 0) {
                 const tag = `<quoted_message>\n${parts.join("\n")}\n</quoted_message>`;
                 text = text ? `${tag}\n${text}` : tag;
@@ -144,17 +209,17 @@ export class Gateway {
 
           for (const item of msg.item_list ?? []) {
             try {
-              if (item.type === 2 && item.image_item?.media?.encrypt_query_param) {
+              if (item.type === 2 && (item.image_item?.media?.encrypt_query_param || item.image_item?.media?.full_url)) {
                 // IMAGE
                 // aeskey (hex string) and media.aes_key (base64 of that hex string) are equivalent.
                 // parseAesKey handles both base64(raw 16 bytes) and base64(hex 32 chars).
                 // media.aes_key = base64(aeskey) so it is always the correct form for parseAesKey.
                 const img = item.image_item;
-                const aesKeyBase64 = img.media!.aes_key ?? (img.aeskey ? Buffer.from(img.aeskey).toString("base64") : undefined);
-                if (!aesKeyBase64) continue;
+                const aesKeyBase64 = img.media!.aes_key ?? (img.aeskey ? Buffer.from(img.aeskey, "hex").toString("base64") : undefined);
                 const buf = await downloadMedia({
                   cdnBaseUrl: this.config.cdnBase,
-                  encryptQueryParam: img.media!.encrypt_query_param!,
+                  encryptQueryParam: img.media!.encrypt_query_param,
+                  fullUrl: img.media!.full_url,
                   aesKeyBase64,
                   fetchFn,
                 });
@@ -163,12 +228,13 @@ export class Gateway {
                 attachments.push({ path: fpath, mime: "image/jpeg" });
                 log("info", `Downloaded image → ${fpath} (${buf.length}B)`, this.config);
 
-              } else if (item.type === 3 && item.voice_item?.media?.encrypt_query_param && item.voice_item.media.aes_key) {
+              } else if (item.type === 3 && (item.voice_item?.media?.encrypt_query_param || item.voice_item?.media?.full_url) && item.voice_item.media.aes_key) {
                 // VOICE — always download SILK file + inject transcript into text
                 const v = item.voice_item;
                 const buf = await downloadMedia({
                   cdnBaseUrl: this.config.cdnBase,
-                  encryptQueryParam: v.media!.encrypt_query_param!,
+                  encryptQueryParam: v.media!.encrypt_query_param,
+                  fullUrl: v.media!.full_url,
                   aesKeyBase64: v.media!.aes_key!,
                   fetchFn,
                 });
@@ -195,12 +261,13 @@ export class Gateway {
                   }
                 }
 
-              } else if (item.type === 4 && item.file_item?.media?.encrypt_query_param && item.file_item.media.aes_key) {
+              } else if (item.type === 4 && (item.file_item?.media?.encrypt_query_param || item.file_item?.media?.full_url) && item.file_item.media.aes_key) {
                 // FILE
                 const f = item.file_item;
                 const buf = await downloadMedia({
                   cdnBaseUrl: this.config.cdnBase,
-                  encryptQueryParam: f.media!.encrypt_query_param!,
+                  encryptQueryParam: f.media!.encrypt_query_param,
+                  fullUrl: f.media!.full_url,
                   aesKeyBase64: f.media!.aes_key!,
                   fetchFn,
                 });
@@ -212,12 +279,13 @@ export class Gateway {
                 attachments.push({ path: fpath, mime });
                 log("info", `Downloaded file "${origName}" → ${fpath} (${buf.length}B)`, this.config);
 
-              } else if (item.type === 5 && item.video_item?.media?.encrypt_query_param && item.video_item.media.aes_key) {
+              } else if (item.type === 5 && (item.video_item?.media?.encrypt_query_param || item.video_item?.media?.full_url) && item.video_item.media.aes_key) {
                 // VIDEO
                 const vid = item.video_item;
                 const buf = await downloadMedia({
                   cdnBaseUrl: this.config.cdnBase,
-                  encryptQueryParam: vid.media!.encrypt_query_param!,
+                  encryptQueryParam: vid.media!.encrypt_query_param,
+                  fullUrl: vid.media!.full_url,
                   aesKeyBase64: vid.media!.aes_key!,
                   fetchFn,
                 });
@@ -228,6 +296,69 @@ export class Gateway {
               }
             } catch (err) {
               log("warn", `Failed to download media item type=${item.type}: ${String(err)}`, this.config);
+            }
+          }
+
+          const quotedMediaItem = attachments.length === 0 ? findQuotedMediaItem(msg.item_list) : undefined;
+          if (quotedMediaItem) {
+            try {
+              if (quotedMediaItem.type === 2 && quotedMediaItem.image_item?.media) {
+                const img = quotedMediaItem.image_item;
+                const media = img.media;
+                if (!media) continue;
+                const aesKeyBase64 = media.aes_key ?? (img.aeskey ? Buffer.from(img.aeskey, "hex").toString("base64") : undefined);
+                const buf = await downloadMedia({
+                  cdnBaseUrl: this.config.cdnBase,
+                  encryptQueryParam: media.encrypt_query_param,
+                  fullUrl: media.full_url,
+                  aesKeyBase64,
+                  fetchFn,
+                });
+                const fpath = `${MEDIA_TMP_DIR}/${Date.now()}-${randomBytes(4).toString("hex")}.jpg`;
+                await writeFile(fpath, buf);
+                attachments.push({ path: fpath, mime: "image/jpeg" });
+              } else if (quotedMediaItem.type === 3 && quotedMediaItem.voice_item?.media?.aes_key) {
+                const v = quotedMediaItem.voice_item;
+                const buf = await downloadMedia({
+                  cdnBaseUrl: this.config.cdnBase,
+                  encryptQueryParam: v.media!.encrypt_query_param,
+                  fullUrl: v.media!.full_url,
+                  aesKeyBase64: v.media!.aes_key,
+                  fetchFn,
+                });
+                const fpath = `${MEDIA_TMP_DIR}/${Date.now()}-${randomBytes(4).toString("hex")}.silk`;
+                await writeFile(fpath, buf);
+                attachments.push({ path: fpath, mime: "audio/silk" });
+              } else if (quotedMediaItem.type === 4 && quotedMediaItem.file_item?.media?.aes_key) {
+                const f = quotedMediaItem.file_item;
+                const buf = await downloadMedia({
+                  cdnBaseUrl: this.config.cdnBase,
+                  encryptQueryParam: f.media!.encrypt_query_param,
+                  fullUrl: f.media!.full_url,
+                  aesKeyBase64: f.media!.aes_key,
+                  fetchFn,
+                });
+                const origName = f.file_name ?? "file.bin";
+                const ext = extname(origName) || ".bin";
+                const mime = guessMime(origName);
+                const fpath = `${MEDIA_TMP_DIR}/${Date.now()}-${randomBytes(4).toString("hex")}${ext}`;
+                await writeFile(fpath, buf);
+                attachments.push({ path: fpath, mime });
+              } else if (quotedMediaItem.type === 5 && quotedMediaItem.video_item?.media?.aes_key) {
+                const vid = quotedMediaItem.video_item;
+                const buf = await downloadMedia({
+                  cdnBaseUrl: this.config.cdnBase,
+                  encryptQueryParam: vid.media!.encrypt_query_param,
+                  fullUrl: vid.media!.full_url,
+                  aesKeyBase64: vid.media!.aes_key,
+                  fetchFn,
+                });
+                const fpath = `${MEDIA_TMP_DIR}/${Date.now()}-${randomBytes(4).toString("hex")}.mp4`;
+                await writeFile(fpath, buf);
+                attachments.push({ path: fpath, mime: "video/mp4" });
+              }
+            } catch (err) {
+              log("warn", `Failed to download quoted media type=${quotedMediaItem.type}: ${String(err)}`, this.config);
             }
           }
 
@@ -363,14 +494,17 @@ export class Gateway {
         sourceKind: "wechat",
         onOutput: async (payload) => {
           const token = await this.auth.getToken();
+          const apiBase = this.auth.getApiBase();
+          const filteredText = this.filterOutboundText(payload.text ?? "");
           const attachments = payload.attachments ?? [];
+          const mediaUrls = attachments.length === 0 ? getOutboundMediaUrls(payload) : [];
 
           if (attachments.length > 0) {
             // Send each attachment, then the text (if any) after the last one
             for (let i = 0; i < attachments.length; i++) {
               const att = attachments[i];
               const isLast = i === attachments.length - 1;
-              const textForThisItem = isLast ? (payload.text ?? "") : "";
+              const textForThisItem = isLast ? filteredText : "";
               log("info", `Sending attachment to ${state.toUser}: ${att.path} (${att.mime})`, this.config);
               try {
                 // Download attachment content via RPC — the path is daemon-internal
@@ -378,12 +512,13 @@ export class Gateway {
                 const fileBuffer = await fileDownload(this.config.daemonUrl, att.path, fetchFn);
                 const isImage = att.mime.startsWith("image/");
                 const isAudio = att.mime.startsWith("audio/");
+                const isVideo = att.mime.startsWith("video/");
 
                 if (isAudio) {
                   // Transcode to SILK, then send as voice message (type:3)
                   const { silk, playtimeMs } = await toSilk(fileBuffer, att.mime);
                   const uploaded = await this.withRetry(() => uploadMedia({
-                    apiBase: this.config.apiBase,
+                    apiBase,
                     cdnBase: this.config.cdnBase,
                     token,
                     filePath: silk,
@@ -392,7 +527,7 @@ export class Gateway {
                     fetchFn,
                   }), "uploadMedia(voice)");
                   await this.withRetry(() => sendMessage(
-                    this.config.apiBase,
+                    apiBase,
                     token,
                     state.toUser,
                     textForThisItem,
@@ -402,17 +537,17 @@ export class Gateway {
                   ), "sendMessage(voice)");
                 } else {
                   const uploaded = await this.withRetry(() => uploadMedia({
-                    apiBase: this.config.apiBase,
+                    apiBase,
                     cdnBase: this.config.cdnBase,
                     token,
                     filePath: fileBuffer,
                     toUserId: state.toUser,
-                    mediaType: isImage ? MEDIA_TYPE_IMAGE : MEDIA_TYPE_FILE,
+                    mediaType: isImage ? MEDIA_TYPE_IMAGE : isVideo ? MEDIA_TYPE_VIDEO : MEDIA_TYPE_FILE,
                     fetchFn,
-                  }), isImage ? "uploadMedia(image)" : "uploadMedia(file)");
-                  const fileName = att.path.split("/").pop() ?? "file";
+                  }), isImage ? "uploadMedia(image)" : isVideo ? "uploadMedia(video)" : "uploadMedia(file)");
+                  const fileName = basename(att.path) || "file";
                   await this.withRetry(() => sendMessage(
-                    this.config.apiBase,
+                    apiBase,
                     token,
                     state.toUser,
                     textForThisItem,
@@ -420,8 +555,10 @@ export class Gateway {
                     fetchFn,
                     isImage
                       ? { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext }
-                      : { kind: "file", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, fileName, fileSize: uploaded.rawSize } },
-                  ), isImage ? "sendMessage(image)" : "sendMessage(file)");
+                      : isVideo
+                        ? { kind: "video", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, videoSize: uploaded.fileSizeCiphertext } }
+                        : { kind: "file", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, fileName, fileSize: uploaded.rawSize } },
+                  ), isImage ? "sendMessage(image)" : isVideo ? "sendMessage(video)" : "sendMessage(file)");
                 }
               } catch (err) {
                 if (err instanceof WechatApiError && err.errcode === -14) {
@@ -430,20 +567,97 @@ export class Gateway {
                 log("error", `sendAttachment failed to ${state.toUser}: ${String(err)}`, this.config);
                 // Fallback: send text only for the last attachment
                 if (isLast && payload.text) {
-                  await this.withRetry(() => sendMessage(this.config.apiBase, token, state.toUser, payload.text!, state.contextToken, fetchFn), "sendMessage(fallback)").catch(e =>
+                  await this.withRetry(() => sendMessage(apiBase, token, state.toUser, filteredText, state.contextToken, fetchFn), "sendMessage(fallback)").catch(e =>
                     log("error", `sendMessage fallback failed: ${String(e)}`, this.config)
                   );
                 }
               }
             }
-          } else if (payload.text) {
-            log("info", `Sending reply to ${state.toUser}: ${payload.text.slice(0, 60)}`, this.config);
+          } else if (mediaUrls.length > 0) {
+            for (let i = 0; i < mediaUrls.length; i++) {
+              const mediaUrl = mediaUrls[i]!;
+              const isLast = i === mediaUrls.length - 1;
+              const textForThisItem = isLast ? filteredText : "";
+              try {
+                const localPath = resolveMediaPath(mediaUrl);
+                const remoteMedia = localPath
+                  ? undefined
+                  : await this.downloadRemoteMedia(mediaUrl, fetchFn);
+                const fileBuffer = remoteMedia?.buffer;
+                const mime = localPath ? guessMime(localPath) : remoteMedia?.mime ?? "application/octet-stream";
+                const isImage = mime.startsWith("image/");
+                const isAudio = mime.startsWith("audio/");
+                const isVideo = mime.startsWith("video/");
+
+                if (isAudio) {
+                  const sourceBuffer = fileBuffer ?? await this.readLocalMedia(localPath!);
+                  const { silk, playtimeMs } = await toSilk(sourceBuffer, mime);
+                  const uploaded = await this.withRetry(() => uploadMedia({
+                    apiBase,
+                    cdnBase: this.config.cdnBase,
+                    token,
+                    filePath: silk,
+                    toUserId: state.toUser,
+                    mediaType: MEDIA_TYPE_VOICE,
+                    fetchFn,
+                  }), "uploadMedia(voice-url)");
+                  await this.withRetry(() => sendMessage(
+                    apiBase,
+                    token,
+                    state.toUser,
+                    textForThisItem,
+                    state.contextToken,
+                    fetchFn,
+                    { kind: "voice", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, playtimeMs } },
+                  ), "sendMessage(voice-url)");
+                } else {
+                  const uploadSource = fileBuffer ?? localPath!;
+                  const uploaded = await this.withRetry(() => uploadMedia({
+                    apiBase,
+                    cdnBase: this.config.cdnBase,
+                    token,
+                    filePath: uploadSource,
+                    toUserId: state.toUser,
+                    mediaType: isImage ? MEDIA_TYPE_IMAGE : isVideo ? MEDIA_TYPE_VIDEO : MEDIA_TYPE_FILE,
+                    fetchFn,
+                  }), isImage ? "uploadMedia(image-url)" : isVideo ? "uploadMedia(video-url)" : "uploadMedia(file-url)");
+                  const fileName = localPath
+                    ? basename(localPath)
+                    : remoteMedia?.fileName ?? basename(mediaUrl.split("?")[0] ?? "file");
+                  await this.withRetry(() => sendMessage(
+                    apiBase,
+                    token,
+                    state.toUser,
+                    textForThisItem,
+                    state.contextToken,
+                    fetchFn,
+                    isImage
+                      ? { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, midSize: uploaded.fileSizeCiphertext }
+                      : isVideo
+                        ? { kind: "video", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, videoSize: uploaded.fileSizeCiphertext } }
+                        : { kind: "file", item: { encryptQueryParam: uploaded.encryptQueryParam, aesKeyBase64: uploaded.aesKeyBase64, fileName, fileSize: uploaded.rawSize } },
+                  ), isImage ? "sendMessage(image-url)" : isVideo ? "sendMessage(video-url)" : "sendMessage(file-url)");
+                }
+              } catch (err) {
+                if (err instanceof WechatApiError && err.errcode === -14) {
+                  this.auth.invalidateToken();
+                }
+                log("error", `sendMediaUrl failed to ${state.toUser}: ${String(err)}`, this.config);
+                if (isLast && payload.text) {
+                  await this.withRetry(() => sendMessage(apiBase, token, state.toUser, filteredText, state.contextToken, fetchFn), "sendMessage(mediaUrl-fallback)").catch(e =>
+                    log("error", `sendMessage mediaUrl fallback failed: ${String(e)}`, this.config)
+                  );
+                }
+              }
+            }
+          } else if (filteredText) {
+            log("info", `Sending reply to ${state.toUser}: ${filteredText.slice(0, 60)}`, this.config);
             try {
               await this.withRetry(() => sendMessage(
-                this.config.apiBase,
+                apiBase,
                 token,
                 state.toUser,
-                payload.text!,
+                filteredText,
                 state.contextToken,
                 fetchFn,
               ), "sendMessage(text)");
@@ -458,7 +672,7 @@ export class Gateway {
                   sessionKey,
                   toUser: state.toUser,
                   contextToken: state.contextToken,
-                  text: payload.text!,
+                  text: filteredText,
                   attachments: [],
                 }).catch((e) => log("warn", `outbox.enqueue failed: ${String(e)}`, this.config));
               }
@@ -536,7 +750,7 @@ export class Gateway {
     }
     try {
       const token = await this.auth.getToken();
-      const resp = await getConfig(this.config.apiBase, token, userId, contextToken, fetchFn);
+      const resp = await getConfig(this.auth.getApiBase(), token, userId, contextToken, fetchFn);
       if (resp.typing_ticket) {
         this.typingTickets.set(userId, { ticket: resp.typing_ticket, fetchedAt: Date.now() });
         return resp.typing_ticket;
@@ -551,7 +765,7 @@ export class Gateway {
     const doSend = async (status: 1 | 2) => {
       try {
         const token = await this.auth.getToken();
-        await sendTyping(this.config.apiBase, token, userId, typingTicket, status, fetchFn);
+        await sendTyping(this.auth.getApiBase(), token, userId, typingTicket, status, fetchFn);
       } catch { /* ignore */ }
     };
     void doSend(1);
@@ -560,6 +774,31 @@ export class Gateway {
       clearInterval(timer);
       void doSend(2);
     };
+  }
+
+  private async readLocalMedia(filePath: string): Promise<Buffer> {
+    return readFile(filePath);
+  }
+
+  private async downloadRemoteMedia(mediaUrl: string, fetchFn: typeof fetch): Promise<{ buffer: Buffer; mime: string; fileName: string }> {
+    const res = await fetchFn(mediaUrl);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "(unreadable)");
+      throw new Error(`Remote media download failed: ${res.status} ${res.statusText} body=${body}`);
+    }
+    const contentType = res.headers?.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+    const mime = contentType || guessMime(new URL(mediaUrl).pathname);
+    const fileName = inferRemoteFileName(mediaUrl, mime);
+    return {
+      buffer: Buffer.from(await res.arrayBuffer()),
+      mime,
+      fileName,
+    };
+  }
+
+  private filterOutboundText(text: string): string {
+    const filter = new StreamingMarkdownFilter();
+    return filter.feed(text) + filter.flush();
   }
 
   private async withRetry<T>(
@@ -602,8 +841,9 @@ export class Gateway {
       if (!this.running) break;
       try {
         const token = await this.auth.getToken();
+        const apiBase = this.auth.getApiBase();
         await this.withRetry(() => sendMessage(
-          this.config.apiBase,
+          apiBase,
           token,
           record.toUser,
           record.text,
@@ -652,6 +892,42 @@ function guessMime(filename: string): string {
     ".wav":  "audio/wav",
   };
   return map[ext] ?? "application/octet-stream";
+}
+
+function extensionForMime(mime: string): string | undefined {
+  const map: Record<string, string> = {
+    "application/pdf": ".pdf",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/zip": ".zip",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "application/json": ".json",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/wav": ".wav",
+  };
+  return map[mime];
+}
+
+function inferRemoteFileName(mediaUrl: string, mime: string): string {
+  const pathName = new URL(mediaUrl).pathname;
+  const baseName = basename(pathName) || "file";
+  if (guessMime(baseName) !== "application/octet-stream") {
+    return baseName;
+  }
+  const ext = extensionForMime(mime);
+  return ext ? `${baseName}${ext}` : baseName;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

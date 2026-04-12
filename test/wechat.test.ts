@@ -1,15 +1,27 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { rm } from "node:fs/promises";
 import {
   getQrCode,
   pollQrStatus,
   getUpdates,
+  getUploadUrl,
   sendMessage,
   splitText,
   WechatApiError,
   CHUNK_SIZE,
 } from "../src/wechat.js";
+import * as wechat from "../src/wechat.js";
+import { Auth } from "../src/auth.js";
 
 const BASE = "https://ilinkai.weixin.qq.com";
+
+vi.mock("qrcode", () => ({
+  default: {
+    toFile: vi.fn().mockResolvedValue(undefined),
+  },
+}));
 
 function makeFetch(response: unknown, status = 200): typeof fetch {
   return vi.fn().mockResolvedValue({
@@ -67,6 +79,16 @@ describe("pollQrStatus", () => {
     expect(result.resolvedBaseUrl).toBe("https://other.example.com");
   });
 
+  it("returns redirect status with redirect_host", async () => {
+    const fetchFn = makeFetch({
+      status: "scaned_but_redirect",
+      redirect_host: "redirect.weixin.qq.com",
+    });
+    const result = await pollQrStatus(BASE, "QR123", fetchFn);
+    expect(result.status).toBe("scaned_but_redirect");
+    expect(result.redirectHost).toBe("redirect.weixin.qq.com");
+  });
+
   it("returns wait on AbortError timeout", async () => {
     const abortErr = new DOMException("timeout", "AbortError");
     const fetchFn = vi.fn().mockRejectedValue(abortErr) as unknown as typeof fetch;
@@ -84,6 +106,33 @@ describe("pollQrStatus", () => {
   it("throws on HTTP error", async () => {
     const fetchFn = makeFetch({}, 500);
     await expect(pollQrStatus(BASE, "QR", fetchFn)).rejects.toThrow("HTTP 500");
+  });
+});
+
+describe("getUploadUrl", () => {
+  it("returns upload_full_url and falls back upload_url to it", async () => {
+    const fetchFn = makeFetch({
+      ret: 0,
+      upload_full_url: "https://cdn.example.com/upload?x=1",
+      upload_param: "UPLOAD_PARAM",
+      encrypt_query_param: "ENC",
+    });
+    const result = await getUploadUrl({
+      baseUrl: BASE,
+      token: "TOKEN",
+      filekey: "FILEKEY",
+      mediaType: 3,
+      toUserId: "user1",
+      rawsize: 12,
+      rawfilemd5: "md5",
+      filesize: 16,
+      aeskey: "aes",
+      fetchFn,
+    });
+    expect(result.upload_full_url).toBe("https://cdn.example.com/upload?x=1");
+    expect(result.upload_url).toBe("https://cdn.example.com/upload?x=1");
+    expect(result.upload_param).toBe("UPLOAD_PARAM");
+    expect(result.encrypt_query_param).toBe("ENC");
   });
 });
 
@@ -201,5 +250,45 @@ describe("splitText", () => {
     const chunks = splitText(text);
     expect(chunks).toHaveLength(n);
     chunks.forEach((c) => expect(c).toHaveLength(CHUNK_SIZE));
+  });
+});
+
+describe("Auth QR redirect", () => {
+  let stateDir: string;
+
+  beforeEach(() => {
+    stateDir = join(tmpdir(), `wechat-auth-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  });
+
+  afterEach(async () => {
+    await rm(stateDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it("switches polling host after scaned_but_redirect", async () => {
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const getQrCodeSpy = vi.spyOn(wechat, "getQrCode").mockResolvedValue({
+      qrcode: "QR123",
+      qrcodeImgUrl: "https://img.example.com/qr.png",
+    });
+    const seenBases: string[] = [];
+    vi.spyOn(wechat, "pollQrStatus").mockImplementation(async (baseUrl) => {
+      seenBases.push(baseUrl);
+      if (seenBases.length === 1) {
+        return { status: "scaned_but_redirect", redirectHost: "redirect.weixin.qq.com" };
+      }
+      return {
+        status: "confirmed",
+        token: "TOKEN",
+        botId: "BOT1",
+        resolvedBaseUrl: "https://redirect.weixin.qq.com",
+      };
+    });
+
+    const auth = new Auth(stateDir, BASE, vi.fn() as unknown as typeof fetch, 0);
+    await expect(auth.startQrLogin()).resolves.toBe("TOKEN");
+    expect(seenBases).toEqual([BASE, "https://redirect.weixin.qq.com"]);
+    expect(getQrCodeSpy).toHaveBeenCalledWith(BASE, expect.any(Function));
+    stdoutSpy.mockRestore();
   });
 });

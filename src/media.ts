@@ -48,22 +48,29 @@ function parseAesKey(aesKeyBase64: string): Buffer {
  */
 export async function downloadMedia(params: {
   cdnBaseUrl: string;
-  encryptQueryParam: string;
-  aesKeyBase64: string;
+  encryptQueryParam?: string;
+  fullUrl?: string;
+  aesKeyBase64?: string;
   fetchFn?: typeof fetch;
 }): Promise<Buffer> {
-  const { cdnBaseUrl, encryptQueryParam, aesKeyBase64, fetchFn = fetch } = params;
+  const { cdnBaseUrl, encryptQueryParam, fullUrl, aesKeyBase64, fetchFn = fetch } = params;
   const base = cdnBaseUrl.endsWith("/") ? cdnBaseUrl.slice(0, -1) : cdnBaseUrl;
-  const url = `${base}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`;
+  const url = fullUrl
+    ? fullUrl
+    : encryptQueryParam
+      ? `${base}/download?encrypted_query_param=${encodeURIComponent(encryptQueryParam)}`
+      : undefined;
+  if (!url) throw new Error("downloadMedia requires fullUrl or encryptQueryParam");
 
   const res = await fetchFn(url);
   if (!res.ok) {
     const body = await res.text().catch(() => "(unreadable)");
     throw new Error(`CDN download failed: ${res.status} ${res.statusText} body=${body}`);
   }
-  const encrypted = Buffer.from(await res.arrayBuffer());
+  const payload = Buffer.from(await res.arrayBuffer());
+  if (!aesKeyBase64) return payload;
   const key = parseAesKey(aesKeyBase64);
-  return decryptAesEcb(encrypted, key);
+  return decryptAesEcb(payload, key);
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +95,7 @@ interface GetUploadUrlResponse {
   upload_param?: string;
   upload_url?: string;
   encrypt_query_param?: string;
+  upload_full_url?: string;
 }
 
 /**
@@ -103,6 +111,7 @@ interface GetUploadUrlResponse {
  */
 /** media_type values from UploadMediaType: 1=IMAGE, 2=VIDEO, 3=FILE, 4=VOICE */
 export const MEDIA_TYPE_IMAGE = 1;
+export const MEDIA_TYPE_VIDEO = 2;
 export const MEDIA_TYPE_FILE = 3;
 export const MEDIA_TYPE_VOICE = 4;
 
@@ -163,13 +172,16 @@ export async function uploadMedia(params: {
   }
 
   const uploadParam = uploadUrlData.upload_param;
-  if (!uploadParam) {
-    throw new Error("getuploadurl returned no upload_param");
+  const uploadFullUrl = uploadUrlData.upload_full_url?.trim();
+  if (!uploadParam && !uploadFullUrl) {
+    throw new Error("getuploadurl returned no upload destination");
   }
 
   // Step 2: encrypt and upload to CDN
   const cdnBaseNorm = cdnBase.endsWith("/") ? cdnBase.slice(0, -1) : cdnBase;
-  const cdnUrl = `${cdnBaseNorm}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
+  const cdnUrl = uploadFullUrl
+    ? uploadFullUrl
+    : `${cdnBaseNorm}/upload?encrypted_query_param=${encodeURIComponent(uploadParam!)}&filekey=${encodeURIComponent(filekey)}`;
   const ciphertext = encryptAesEcb(plaintext, aeskey);
 
   const cdnRes = await fetchFn(cdnUrl, {
