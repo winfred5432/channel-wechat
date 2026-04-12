@@ -93,6 +93,20 @@ describe("Auth", () => {
       expect(token).toBe("LEGACYTOKEN");
       expect((fetchFn as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
+
+    it("clears stale qr artifacts when booting from saved credentials", async () => {
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, "credentials.json"), JSON.stringify({ token: "SAVEDTOKEN" }));
+      await writeFile(join(stateDir, "qrcode.png"), "stale-png");
+      await writeFile(join(stateDir, "qrcode.txt"), "stale-qr");
+
+      const fetchFn = vi.fn() as unknown as typeof fetch;
+      const auth = new Auth(stateDir, BASE, fetchFn, 0);
+
+      await expect(auth.getToken()).resolves.toBe("SAVEDTOKEN");
+      await expect(readFile(join(stateDir, "qrcode.png"), "utf8")).rejects.toThrow();
+      await expect(readFile(join(stateDir, "qrcode.txt"), "utf8")).rejects.toThrow();
+    });
   });
 
   describe("token persistence", () => {

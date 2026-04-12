@@ -32,4 +32,14 @@ describe("runCli", () => {
 
     expect(stdoutSpy).toHaveBeenCalled();
   });
+
+  it("explains that qrcode-terminal only works for a current pending qr", async () => {
+    const stateDir = makeStateDir();
+    cleanupDirs.push(stateDir);
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, "qrcode.png"), "stale-png", "utf8");
+    process.env.WECHAT_STATE_DIR = stateDir;
+
+    await expect(runCli(["qrcode-terminal"])).rejects.toThrow(/current pending QR|stale/i);
+  });
 });

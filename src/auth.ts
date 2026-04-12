@@ -39,6 +39,7 @@ export class Auth {
 
   async getToken(): Promise<string> {
     if (this.cached) {
+      await this.cleanupQrPng();
       // 超过 12h 且没有刷新进行中 → 后台静默刷新
       if (
         this.tokenObtainedAt > 0 &&
@@ -51,6 +52,7 @@ export class Auth {
     }
     const saved = await this.loadCredentials();
     if (saved) {
+      await this.cleanupQrPng();
       this.cached = saved;
       if (saved.apiBase) this.apiBase = saved.apiBase;
       if (this.tokenObtainedAt === 0) this.tokenObtainedAt = Date.now();

@@ -37,9 +37,26 @@ export async function printPendingQrCodeTerminal(
   stateDir: string,
   writer: OutputWriter = (chunk) => process.stdout.write(chunk),
 ): Promise<void> {
-  const qrPayload = (await readFile(getQrCodeTextPath(stateDir), "utf8")).trim();
+  const txtPath = getQrCodeTextPath(stateDir);
+  let qrPayload: string;
+  try {
+    qrPayload = (await readFile(txtPath, "utf8")).trim();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      const pngPath = getQrCodePngPath(stateDir);
+      if (existsSync(pngPath)) {
+        throw new Error(
+          `No current pending QR code found in ${stateDir}. Existing ${pngPath} is likely stale; trigger a fresh QR login before using qrcode-terminal.`,
+        );
+      }
+      throw new Error(
+        `No current pending QR code found in ${stateDir}. Start a fresh QR login before using qrcode-terminal.`,
+      );
+    }
+    throw error;
+  }
   if (!qrPayload) {
-    throw new Error(`No pending QR code found in ${stateDir}`);
+    throw new Error(`No current pending QR code found in ${stateDir}. Start a fresh QR login before using qrcode-terminal.`);
   }
 
   const QRCode = (await import("qrcode")).default;
