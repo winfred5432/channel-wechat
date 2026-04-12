@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile, chmod, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { getQrCode, pollQrStatus, WechatApiError } from "./wechat.js";
+import { clearPendingQrCode, getQrCodePngPath, savePendingQrCode } from "./qr-state.js";
 
 interface Credentials {
   token: string;
@@ -33,7 +34,7 @@ export class Auth {
     this.apiBase = apiBase;
     this.credFile = resolve(stateDir, "credentials.json");
     this.syncBufFile = resolve(stateDir, "sync-buf.txt");
-    this.qrcodePng = resolve(stateDir, "qrcode.png");
+    this.qrcodePng = getQrCodePngPath(stateDir);
   }
 
   async getToken(): Promise<string> {
@@ -67,13 +68,18 @@ export class Auth {
     const { qrcode: qrcodeStr, qrcodeImgUrl } = await getQrCode(this.apiBase, this.fetchFn);
 
     await this.ensureStateDir();
+    await savePendingQrCode(this.stateDir, qrcodeImgUrl);
 
     // Render QR image URL to PNG file so agent can send it via Feishu attachment
     const QRCode = (await import("qrcode")).default;
     await QRCode.toFile(this.qrcodePng, qrcodeImgUrl, { type: "png", width: 300 });
+    const terminalQr = await QRCode.toString(qrcodeImgUrl, { type: "terminal", small: true });
 
     // Signal to agent: PNG is ready at this path
     process.stdout.write(`QRCODE_READY:${this.qrcodePng}\n`);
+    process.stdout.write("QRCODE_TERMINAL_BEGIN\n");
+    process.stdout.write(terminalQr.endsWith("\n") ? terminalQr : `${terminalQr}\n`);
+    process.stdout.write("QRCODE_TERMINAL_END\n");
 
     // Long-poll until confirmed or expired
     const deadline = Date.now() + 8 * 60 * 1000; // 8 min (matches reference impl)
@@ -182,11 +188,7 @@ export class Auth {
   }
 
   private async cleanupQrPng(): Promise<void> {
-    try {
-      await unlink(this.qrcodePng);
-    } catch {
-      // ignore if already gone
-    }
+    await clearPendingQrCode(this.stateDir);
   }
 
   private async ensureStateDir(): Promise<void> {

@@ -1,11 +1,12 @@
-#!/usr/bin/env node
 import { writeFileSync, readFileSync, unlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { loadConfig } from "./config.js";
+import { pathToFileURL } from "node:url";
+import { loadConfig, resolveStateDir } from "./config.js";
 import { Auth } from "./auth.js";
 import { Gateway } from "./gateway.js";
 import { startHealthServer } from "./health.js";
 import { OutboxQueue } from "./outbox.js";
+import { printPendingQrCodeTerminal } from "./qr-state.js";
 
 const PIDFILE = "/tmp/channel-wechat.pid";
 
@@ -29,7 +30,21 @@ function releaseLock(): void {
   try { unlinkSync(PIDFILE); } catch { /* ignore */ }
 }
 
-async function main() {
+function readStateDirArg(args: string[]): string | undefined {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--state-dir") return args[i + 1];
+    if (arg.startsWith("--state-dir=")) return arg.slice("--state-dir=".length);
+  }
+  return undefined;
+}
+
+async function runQrCodeTerminal(args: string[]): Promise<void> {
+  const stateDir = readStateDirArg(args) ?? resolveStateDir();
+  await printPendingQrCodeTerminal(stateDir);
+}
+
+async function runAdapter() {
   acquireLock();
 
   let config;
@@ -83,7 +98,21 @@ async function main() {
   process.on("exit", releaseLock);
 }
 
-main().catch((err) => {
-  console.error("[FATAL]", err);
-  process.exit(1);
-});
+export async function runCli(argv: string[] = process.argv.slice(2)): Promise<void> {
+  const [command, ...args] = argv;
+  if (command === "qrcode-terminal") {
+    await runQrCodeTerminal(args);
+    return;
+  }
+  await runAdapter();
+}
+
+const entryArg = process.argv[1];
+const isEntrypoint = Boolean(entryArg) && import.meta.url === pathToFileURL(entryArg).href;
+
+if (isEntrypoint) {
+  runCli().catch((err) => {
+    console.error("[FATAL]", err);
+    process.exit(1);
+  });
+}

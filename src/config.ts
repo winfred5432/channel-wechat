@@ -11,6 +11,13 @@ export interface Config {
   logLevel: string;
 }
 
+export function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
+  const stateDirRaw = env.WECHAT_STATE_DIR ?? "~/.aladuo/channel-wechat";
+  return stateDirRaw.startsWith("~")
+    ? resolve(homedir(), stateDirRaw.slice(2))
+    : resolve(stateDirRaw);
+}
+
 export function loadConfig(): Config {
   const dmPolicy = process.env.WECHAT_DM_POLICY ?? "open";
   if (dmPolicy !== "open" && dmPolicy !== "allowlist") {
@@ -27,10 +34,7 @@ export function loadConfig(): Config {
     throw new Error("WECHAT_DM_POLICY=allowlist requires WECHAT_ALLOW_FROM to be set");
   }
 
-  const stateDirRaw = process.env.WECHAT_STATE_DIR ?? "~/.aladuo/channel-wechat";
-  const stateDir = stateDirRaw.startsWith("~")
-    ? resolve(homedir(), stateDirRaw.slice(2))
-    : resolve(stateDirRaw);
+  const stateDir = resolveStateDir();
 
   const logLevel = process.env.WECHAT_LOG_LEVEL ?? "info";
   if (!["error", "warn", "info", "debug"].includes(logLevel)) {

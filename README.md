@@ -40,6 +40,19 @@ npm start
 
 The agent monitors stdout for `QRCODE_READY:` and `WECHAT_CONNECTED:` signals.
 
+For stdio or TTY workflows, render the current pending QR code as terminal
+characters without parsing logs:
+
+```bash
+duoduo-wechat qrcode-terminal --state-dir ~/.aladuo/channel-wechat
+```
+
+If you are running from a source checkout or package root:
+
+```bash
+node dist/plugin.js qrcode-terminal --state-dir ~/.aladuo/channel-wechat
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -48,7 +61,7 @@ The agent monitors stdout for `QRCODE_READY:` and `WECHAT_CONNECTED:` signals.
 | `WECHAT_API_BASE` | `https://ilinkai.weixin.qq.com` | ilink bot API base URL |
 | `WECHAT_DM_POLICY` | `open` | `open` (all users) or `allowlist` |
 | `WECHAT_ALLOW_FROM` | — | Comma-separated WeChat userIds (allowlist mode only) |
-| `WECHAT_STATE_DIR` | `~/.openduo/wechat-channel` | Persisted token and sync cursor |
+| `WECHAT_STATE_DIR` | `~/.aladuo/channel-wechat` | Persisted token and sync cursor |
 | `WECHAT_LOG_LEVEL` | `info` | `error` \| `warn` \| `info` \| `debug` |
 
 ## Architecture
@@ -71,13 +84,14 @@ WeChat (ilink bot API)
 
 ## State Directory
 
-Default: `~/.openduo/wechat-channel/`
+Default: `~/.aladuo/channel-wechat/`
 
 | File | Description |
 |------|-------------|
 | `credentials.json` | Auth token (chmod 600) |
 | `sync-buf.txt` | Message cursor for getupdates |
 | `qrcode.png` | Temporary — deleted after scan |
+| `qrcode.txt` | Temporary raw QR payload for `qrcode-terminal` |
 
 ## Development
 

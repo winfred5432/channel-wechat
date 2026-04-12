@@ -14,6 +14,7 @@ function makeStateDir(): string {
 vi.mock("qrcode", () => ({
   default: {
     toFile: vi.fn().mockResolvedValue(undefined),
+    toString: vi.fn().mockResolvedValue("ASCII QR\n"),
   },
 }));
 
@@ -115,6 +116,42 @@ describe("Auth", () => {
       expect(data.token).toBe("T123");
       // No TTL — ilink bot token lifetime is server-controlled, detected via -14 error
       expect(data.expiresAt).toBeUndefined();
+    });
+  });
+
+  describe("QR output signals", () => {
+    it("emits both PNG path and terminal QR markers during login", async () => {
+      const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      const fetchFn = mockFetchImmediate("QRTOKEN");
+      const auth = new Auth(stateDir, BASE, fetchFn, 0);
+
+      await expect(auth.startQrLogin()).resolves.toBe("QRTOKEN");
+
+      const writes = stdoutSpy.mock.calls.map((call) => String(call[0]));
+      expect(writes.some((line) => line.startsWith("QRCODE_READY:"))).toBe(true);
+      expect(writes).toContain("QRCODE_TERMINAL_BEGIN\n");
+      expect(writes).toContain("ASCII QR\n");
+      expect(writes).toContain("QRCODE_TERMINAL_END\n");
+
+      stdoutSpy.mockRestore();
+    });
+
+    it("uses the same scannable payload for png and terminal qr", async () => {
+      const fetchFn = mockFetchImmediate("QRTOKEN");
+      const auth = new Auth(stateDir, BASE, fetchFn, 0);
+      const QRCode = (await import("qrcode")).default;
+
+      await expect(auth.startQrLogin()).resolves.toBe("QRTOKEN");
+
+      expect(QRCode.toFile).toHaveBeenCalledWith(
+        expect.stringContaining("qrcode.png"),
+        "https://img.example.com/qr.png",
+        expect.any(Object),
+      );
+      expect(QRCode.toString).toHaveBeenCalledWith(
+        "https://img.example.com/qr.png",
+        expect.objectContaining({ type: "terminal" }),
+      );
     });
   });
 
