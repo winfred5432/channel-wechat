@@ -1,6 +1,6 @@
 # @openduo/channel-wechat
 
-WeChat channel adapter for [openduo](https://openduo.ai) — connects WeChat (via ilink bot API) to your duoduo agent.
+WeChat channel plugin for [duoduo](https://openduo.ai) — connects WeChat (via ilink bot API) to your duoduo agent.
 
 ## How it works
 
@@ -13,13 +13,26 @@ WeChat channel adapter for [openduo](https://openduo.ai) — connects WeChat (vi
 
 **The entire onboarding flow happens inside Feishu — no terminal access required.**
 
-## Feishu Agent Quickstart
+## Install
+
+```bash
+duoduo channel install @openduo/channel-wechat
+```
+
+For a local tarball:
+
+```bash
+npm pack
+duoduo channel install ./openduo-channel-wechat-0.1.0.tgz
+```
+
+## Quickstart
 
 ```bash
 gh repo clone winfred5432/channel-wechat
 cd channel-wechat
-npm install
-npm run build
+npm ci
+npm run build:plugin
 cp .env.example .env
 # edit .env if needed
 npm start
@@ -69,11 +82,11 @@ Default: `~/.openduo/wechat-channel/`
 ## Development
 
 ```bash
-npm install
+npm ci
 npm run dev         # run with tsx (hot reload friendly)
 npm test            # vitest unit tests
 npm run test:coverage  # coverage report
-npm run build       # tsc compile
+npm run build       # bundle dist/plugin.js
 ```
 
 ## License

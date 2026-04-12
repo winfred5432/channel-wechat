@@ -2,15 +2,41 @@
   "name": "@openduo/channel-wechat",
   "version": "0.1.0",
   "type": "module",
-  "description": "WeChat channel adapter for openduo",
-  "main": "dist/index.js",
+  "description": "WeChat channel plugin for duoduo",
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "dist/plugin.js",
+  "files": [
+    "dist/",
+    "README.md",
+    "package.json"
+  ],
   "bin": {
-    "openduo-wechat": "./dist/index.js"
+    "duoduo-wechat": "./dist/plugin.js"
+  },
+  "aladuo": {
+    "channel": {
+      "type": "wechat",
+      "bin": "dist/plugin.js",
+      "envAllowlist": [
+        "ALADUO_DAEMON_URL",
+        "WECHAT_API_BASE",
+        "WECHAT_DM_POLICY",
+        "WECHAT_ALLOW_FROM",
+        "WECHAT_STATE_DIR",
+        "WECHAT_LOG_LEVEL",
+        "WECHAT_HEALTH_PORT"
+      ]
+    }
   },
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:qrcode --external:silk-wasm",
+    "build": "npm run build:plugin",
+    "build:plugin": "node scripts/build-plugin.mjs",
+    "prepack": "npm run build:plugin",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
+    "start": "node dist/plugin.js",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage"
   },
@@ -23,6 +49,7 @@
     "@types/node": "^22",
     "@types/qrcode": "^1.5.5",
     "@vitest/coverage-v8": "^2",
+    "esbuild": "^0.27.4",
     "tsx": "^4",
     "typescript": "^5",
     "vitest": "^2.1.9"
