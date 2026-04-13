@@ -8,6 +8,8 @@ import {
   getUpdates,
   getUploadUrl,
   sendMessage,
+  getConfig,
+  sendTyping,
   splitText,
   buildBaseInfo,
   sanitizeBotAgent,
@@ -246,6 +248,62 @@ describe("sendMessage", () => {
     await sendMessage(BASE, "TOKEN", "user1", "hi", undefined, fetchFn);
     const opts = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0][1] as RequestInit;
     expect((opts.headers as Record<string, string>)["AuthorizationType"]).toBe("ilink_bot_token");
+  });
+
+  it("sends native voice messages with default SILK metadata", async () => {
+    const fetchFn = makeFetch({ ret: 0 });
+    await sendMessage(
+      BASE,
+      "TOKEN",
+      "user1",
+      "",
+      "CTX",
+      fetchFn,
+      {
+        kind: "voice",
+        item: {
+          encryptQueryParam: "ENC",
+          aesKeyBase64: "AES",
+        },
+      },
+    );
+    const body = JSON.parse((fetchFn as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body.msg.item_list[0].type).toBe(3);
+    expect(body.msg.item_list[0].voice_item.encode_type).toBe(6);
+    expect(body.msg.item_list[0].voice_item.sample_rate).toBe(16000);
+    expect(body.msg.item_list[0].voice_item.bits_per_sample).toBe(16);
+    expect(body.msg.item_list[0].voice_item.playtime).toBe(0);
+    expect(body.msg.context_token).toBe("CTX");
+  });
+});
+
+describe("getConfig", () => {
+  it("posts ilink_user_id and context_token", async () => {
+    const fetchFn = makeFetch({ ret: 0, typing_ticket: "TT" });
+    const result = await getConfig(BASE, "TOKEN", "user1", "CTX", fetchFn);
+    expect(result.typing_ticket).toBe("TT");
+    const [url, opts] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("getconfig");
+    const body = JSON.parse(opts.body as string);
+    expect(body.ilink_user_id).toBe("user1");
+    expect(body.context_token).toBe("CTX");
+  });
+});
+
+describe("sendTyping", () => {
+  it("posts typing status to the typing endpoint", async () => {
+    const fetchFn = makeFetch({ ret: 0 });
+    await sendTyping(BASE, "TOKEN", "user1", "TT", 1, fetchFn);
+    const [url, opts] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("sendtyping");
+    const body = JSON.parse(opts.body as string);
+    expect(body.status).toBe(1);
+    expect(body.typing_ticket).toBe("TT");
+  });
+
+  it("swallows transport failures", async () => {
+    const fetchFn = vi.fn().mockRejectedValue(new Error("network down")) as unknown as typeof fetch;
+    await expect(sendTyping(BASE, "TOKEN", "user1", "TT", 2, fetchFn)).resolves.toBeUndefined();
   });
 });
 

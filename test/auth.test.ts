@@ -133,6 +133,59 @@ describe("Auth", () => {
     });
   });
 
+  describe("helpers", () => {
+    it("exposes the current api base after a redirect login", async () => {
+      const fetchFn = vi.fn().mockImplementation(async (url: string) => {
+        if (url.includes("get_bot_qrcode")) {
+          return {
+            ok: true,
+            json: async () => ({ qrcode: "QR123", qrcode_img_content: "https://img.example.com/qr.png" }),
+          };
+        }
+        if (url.includes("get_qrcode_status")) {
+          return {
+            ok: true,
+            json: async () => ({
+              status: "confirmed",
+              bot_token: "TOKEN",
+              ilink_bot_id: "BOT1",
+              baseurl: "https://redirect.weixin.qq.com",
+            }),
+          };
+        }
+        return { ok: true, json: async () => ({}) };
+      }) as unknown as typeof fetch;
+
+      const auth = new Auth(stateDir, BASE, fetchFn, 0);
+      await expect(auth.startQrLogin()).resolves.toBe("TOKEN");
+      expect(auth.getApiBase()).toBe("https://redirect.weixin.qq.com");
+    });
+
+    it("relogin forces a fresh qr flow even when credentials are cached", async () => {
+      const fetchFn = vi.fn()
+        .mockImplementationOnce(async () => ({
+          ok: true,
+          json: async () => ({ qrcode: "QR123", qrcode_img_content: "https://img.example.com/qr-1.png" }),
+        }))
+        .mockImplementationOnce(async () => ({
+          ok: true,
+          json: async () => ({ status: "confirmed", bot_token: "TOKEN1", ilink_bot_id: "BOT1" }),
+        }))
+        .mockImplementationOnce(async () => ({
+          ok: true,
+          json: async () => ({ qrcode: "QR456", qrcode_img_content: "https://img.example.com/qr-2.png" }),
+        }))
+        .mockImplementationOnce(async () => ({
+          ok: true,
+          json: async () => ({ status: "confirmed", bot_token: "TOKEN2", ilink_bot_id: "BOT2" }),
+        })) as unknown as typeof fetch;
+
+      const auth = new Auth(stateDir, BASE, fetchFn, 0);
+      await expect(auth.getToken()).resolves.toBe("TOKEN1");
+      await expect(auth.relogin()).resolves.toBe("TOKEN2");
+    });
+  });
+
   describe("QR output signals", () => {
     it("emits both PNG path and terminal QR markers during login", async () => {
       const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
