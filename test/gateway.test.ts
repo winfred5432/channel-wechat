@@ -217,6 +217,55 @@ function pullResult(records: unknown[]) {
   return { jsonrpc: "2.0", id: 1, result: { records, idle: records.length === 0 } };
 }
 
+describe("Gateway abort handling", () => {
+  it("honors API helper timeout signals when injecting the gateway abort signal", async () => {
+    const config = { ...BASE_CONFIG };
+    const auth = makeAuth();
+    const timeoutController = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutController.signal);
+
+    let gateway: Gateway | undefined;
+    let saveResolved: (() => void) | undefined;
+    const savePromise = new Promise<void>((resolve) => { saveResolved = resolve; });
+    (auth.saveSyncBuf as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      saveResolved?.();
+      gateway?.stop();
+    });
+
+    const fetchFn = vi.fn().mockImplementation(async (_url: string, opts?: RequestInit) => {
+      return new Promise<never>((_resolve, reject) => {
+        const signal = opts?.signal;
+        if (signal?.aborted) {
+          reject(new DOMException("Aborted", "AbortError"));
+          return;
+        }
+        signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      gateway = new Gateway(config, auth, fetchFn);
+      gateway.start();
+
+      await vi.waitFor(() => {
+        expect(fetchFn).toHaveBeenCalled();
+      });
+
+      timeoutController.abort();
+
+      const timedOut = await Promise.race([
+        savePromise.then(() => false),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 50)),
+      ]);
+
+      expect(timedOut).toBe(false);
+    } finally {
+      gateway?.stop();
+      timeoutSpy.mockRestore();
+    }
+  });
+});
+
 describe("Gateway allowlist filtering", () => {
   it("blocks messages from users not in allowlist", async () => {
     const config: Config = { ...BASE_CONFIG, dmPolicy: "allowlist", allowFrom: ["allowed-user"] };

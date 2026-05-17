@@ -28,6 +28,13 @@ function log(level: string, msg: string, cfg?: Config) {
   }
 }
 
+function mergeAbortSignals(gatewaySignal: AbortSignal, requestSignal?: AbortSignal | null): AbortSignal {
+  if (!requestSignal || requestSignal === gatewaySignal) return gatewaySignal;
+  if (gatewaySignal.aborted) return gatewaySignal;
+  if (requestSignal.aborted) return requestSignal;
+  return AbortSignal.any([gatewaySignal, requestSignal]);
+}
+
 function extractReferencedText(item?: WechatMsgItem): string {
   if (!item) return "";
   if (item.text_item?.text) return item.text_item.text;
@@ -128,7 +135,7 @@ export class Gateway {
     // Wrap fetchFn to inject the abort signal into every request
     const fetch = this.fetchFn;
     const abortableFetch: typeof fetch = (url, init) =>
-      fetch(url, { ...init, signal });
+      fetch(url, { ...init, signal: mergeAbortSignals(signal, init?.signal) });
     void this.ingressLoop(abortableFetch);
     void this.pullLoop(abortableFetch);
     if (this.outbox) void this.replayOutbox(abortableFetch);
