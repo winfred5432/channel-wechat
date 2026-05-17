@@ -1,7 +1,138 @@
 import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, parse } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const WECHAT_BASE = "https://ilinkai.weixin.qq.com";
 export const CHUNK_SIZE = 4000;
+const DEFAULT_BOT_AGENT_NAME = "Duoduo";
+
+interface PackageJson {
+  name?: string;
+  version?: string;
+  ilink_appid?: string;
+}
+
+function isOwnPackageJson(parsed: PackageJson): boolean {
+  if (parsed.ilink_appid !== undefined) return true;
+  return typeof parsed.name === "string" && parsed.name.includes("channel-wechat");
+}
+
+function readPackageJsonFromDir(startDir: string): PackageJson {
+  try {
+    let dir = startDir;
+    const { root } = parse(dir);
+    while (dir && dir !== root) {
+      const candidate = join(dir, "package.json");
+      if (existsSync(candidate)) {
+        try {
+          const parsed = JSON.parse(readFileSync(candidate, "utf-8")) as PackageJson;
+          if (isOwnPackageJson(parsed)) return parsed;
+        } catch {
+          // Keep walking up; malformed/package-shadow files should not break protocol defaults.
+        }
+      }
+      dir = dirname(dir);
+    }
+  } catch {
+    // Fall through to protocol-safe defaults.
+  }
+  return {};
+}
+
+function readPackageJson(): PackageJson {
+  return readPackageJsonFromDir(dirname(fileURLToPath(import.meta.url)));
+}
+
+const pkg = readPackageJson();
+const CHANNEL_VERSION = pkg.version ?? "unknown";
+const ILINK_APP_ID = pkg.ilink_appid ?? "bot";
+
+function buildClientVersion(version: string): number {
+  const parts = version.split(".").map((p) => parseInt(p, 10));
+  const major = parts[0] ?? 0;
+  const minor = parts[1] ?? 0;
+  const patch = parts[2] ?? 0;
+  return ((major & 0xff) << 16) | ((minor & 0xff) << 8) | (patch & 0xff);
+}
+
+const ILINK_APP_CLIENT_VERSION = buildClientVersion(pkg.version ?? "0.0.0");
+
+export const DEFAULT_BOT_AGENT = `${DEFAULT_BOT_AGENT_NAME}/${CHANNEL_VERSION === "unknown" ? "0.0.0" : CHANNEL_VERSION}`;
+
+export interface BaseInfo {
+  channel_version: string;
+  /** Self-declared upstream bot/app identity, analogous to HTTP User-Agent. */
+  bot_agent: string;
+}
+
+export function sanitizeBotAgent(raw: string | undefined): string {
+  if (!raw || typeof raw !== "string") return DEFAULT_BOT_AGENT;
+  const trimmed = raw.trim();
+  if (!trimmed) return DEFAULT_BOT_AGENT;
+
+  const productRe = /^[A-Za-z0-9_.-]{1,32}\/[A-Za-z0-9_.+\-]{1,32}$/;
+  const commentCharRe = /^[\x20-\x27\x2A-\x7E]{1,64}$/;
+
+  const rawTokens = trimmed.split(/\s+/);
+  const tokens: string[] = [];
+  for (let i = 0; i < rawTokens.length; i += 1) {
+    const tok = rawTokens[i];
+    if (tok.startsWith("(") && !tok.endsWith(")")) {
+      let acc = tok;
+      while (i + 1 < rawTokens.length && !acc.endsWith(")")) {
+        i += 1;
+        acc += " " + rawTokens[i];
+      }
+      tokens.push(acc);
+    } else {
+      tokens.push(tok);
+    }
+  }
+
+  const accepted: string[] = [];
+  let pendingProduct: string | null = null;
+  for (const tok of tokens) {
+    if (tok.startsWith("(") && tok.endsWith(")")) {
+      const inner = tok.slice(1, -1);
+      if (pendingProduct && commentCharRe.test(inner)) {
+        accepted.push(`${pendingProduct} (${inner})`);
+        pendingProduct = null;
+      } else if (pendingProduct) {
+        accepted.push(pendingProduct);
+        pendingProduct = null;
+      }
+      continue;
+    }
+    if (pendingProduct) {
+      accepted.push(pendingProduct);
+      pendingProduct = null;
+    }
+    if (productRe.test(tok)) pendingProduct = tok;
+  }
+  if (pendingProduct) accepted.push(pendingProduct);
+
+  if (accepted.length === 0) return DEFAULT_BOT_AGENT;
+  const joined = accepted.join(" ");
+  if (Buffer.byteLength(joined, "utf-8") <= 256) return joined;
+
+  const truncated: string[] = [];
+  let len = 0;
+  for (const token of accepted) {
+    const add = (truncated.length === 0 ? 0 : 1) + Buffer.byteLength(token, "utf-8");
+    if (len + add > 256) break;
+    truncated.push(token);
+    len += add;
+  }
+  return truncated.length > 0 ? truncated.join(" ") : DEFAULT_BOT_AGENT;
+}
+
+export function buildBaseInfo(botAgent = process.env.WECHAT_BOT_AGENT): BaseInfo {
+  return {
+    channel_version: CHANNEL_VERSION,
+    bot_agent: sanitizeBotAgent(botAgent),
+  };
+}
 
 /** CDN media reference embedded in an item. */
 export interface CDNMedia {
@@ -103,6 +234,13 @@ function randomWechatUin(): string {
   return Buffer.from(String(uint32), "utf-8").toString("base64");
 }
 
+export function buildCommonHeaders(): Record<string, string> {
+  return {
+    "iLink-App-Id": ILINK_APP_ID,
+    "iLink-App-ClientVersion": String(ILINK_APP_CLIENT_VERSION),
+  };
+}
+
 /** Build required headers for ilink bot API POST requests */
 function buildHeaders(token: string | undefined, body: string): Record<string, string> {
   const headers: Record<string, string> = {
@@ -110,6 +248,7 @@ function buildHeaders(token: string | undefined, body: string): Record<string, s
     "Content-Length": String(Buffer.byteLength(body, "utf-8")),
     AuthorizationType: "ilink_bot_token",
     "X-WECHAT-UIN": randomWechatUin(),
+    ...buildCommonHeaders(),
   };
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
@@ -123,7 +262,7 @@ export async function getQrCode(
 ): Promise<{ qrcode: string; qrcodeImgUrl: string }> {
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   const url = `${base}ilink/bot/get_bot_qrcode?bot_type=3`;
-  const res = await fetchFn(url, { method: "GET" });
+  const res = await fetchFn(url, { method: "GET", headers: buildCommonHeaders() });
   if (!res.ok) throw new Error(`HTTP ${res.status} from getQrCode`);
   const data = (await res.json()) as QrCodeResponse;
   return { qrcode: data.qrcode, qrcodeImgUrl: data.qrcode_img_content };
@@ -147,7 +286,7 @@ export async function pollQrStatus(
   try {
     res = await fetchFn(url, {
       method: "GET",
-      headers: { "iLink-App-ClientVersion": "1" },
+      headers: buildCommonHeaders(),
       signal: AbortSignal.timeout(35_000),
     });
   } catch (err: unknown) {
@@ -177,7 +316,7 @@ export async function getUpdates(
   const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
   const body = JSON.stringify({
     get_updates_buf: syncBuf,
-    base_info: { channel_version: "claude-code-1.0" },
+    base_info: buildBaseInfo(),
   });
   let rawText: string;
   try {
@@ -324,7 +463,7 @@ export async function sendMessage(
     if (contextToken) msgBody.context_token = contextToken;
     const body = JSON.stringify({
       msg: msgBody,
-      base_info: { channel_version: "claude-code-1.0" },
+      base_info: buildBaseInfo(),
     });
     const res = await fetchFn(`${base}ilink/bot/sendmessage`, {
       method: "POST",
@@ -355,7 +494,7 @@ export async function sendMessage(
     if (contextToken) msgBody.context_token = contextToken;
     const body = JSON.stringify({
       msg: msgBody,
-      base_info: { channel_version: "claude-code-1.0" },
+      base_info: buildBaseInfo(),
     });
     const res = await fetchFn(`${base}ilink/bot/sendmessage`, {
       method: "POST",
@@ -402,7 +541,7 @@ export async function getUploadUrl(params: {
     filesize: rest.filesize,
     no_need_thumb: true,
     aeskey: rest.aeskey,
-    base_info: { channel_version: "claude-code-1.0" },
+    base_info: buildBaseInfo(),
   });
   const res = await fetchFn(`${base}ilink/bot/getuploadurl`, {
     method: "POST",
@@ -458,7 +597,7 @@ export async function getConfig(
   const body = JSON.stringify({
     ilink_user_id: ilinkUserId,
     context_token: contextToken,
-    base_info: {},
+    base_info: buildBaseInfo(),
   });
   const res = await fetchFn(`${base}ilink/bot/getconfig`, {
     method: "POST",
@@ -487,7 +626,7 @@ export async function sendTyping(
     ilink_user_id: ilinkUserId,
     typing_ticket: typingTicket,
     status,
-    base_info: {},
+    base_info: buildBaseInfo(),
   });
   try {
     await fetchFn(`${base}ilink/bot/sendtyping`, {

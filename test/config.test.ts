@@ -25,6 +25,7 @@ describe("loadConfig", () => {
     delete process.env.WECHAT_STATE_DIR;
     delete process.env.WECHAT_LOG_LEVEL;
     delete process.env.WECHAT_API_BASE;
+    delete process.env.WECHAT_BOT_AGENT;
     delete process.env.ALADUO_DAEMON_URL;
   });
 
@@ -35,7 +36,14 @@ describe("loadConfig", () => {
     expect(config.logLevel).toBe("info");
     expect(config.daemonUrl).toBe("http://127.0.0.1:20233");
     expect(config.apiBase).toBe("https://ilinkai.weixin.qq.com");
+    expect(config.botAgent).toMatch(/^Duoduo\/(?:\d+\.\d+\.\d+|0\.0\.0)$/);
     expect(config.stateDir).toContain(".aladuo");
+  });
+
+  it("allows overriding bot agent", () => {
+    withEnv({ WECHAT_BOT_AGENT: "Duoduo/0.1.2 (prod)" }, () => {
+      expect(loadConfig().botAgent).toBe("Duoduo/0.1.2 (prod)");
+    });
   });
 
   it("resolves ~ in stateDir", () => {

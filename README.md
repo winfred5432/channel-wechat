@@ -63,6 +63,7 @@ node dist/plugin.js qrcode-terminal --state-dir ~/.aladuo/channel-wechat
 | `WECHAT_ALLOW_FROM` | — | Comma-separated WeChat userIds (allowlist mode only) |
 | `WECHAT_STATE_DIR` | `~/.aladuo/channel-wechat` | Persisted token and sync cursor |
 | `WECHAT_LOG_LEVEL` | `info` | `error` \| `warn` \| `info` \| `debug` |
+| `WECHAT_BOT_AGENT` | `Duoduo/<package-version>` | Self-declared UA-style bot agent sent as `base_info.bot_agent` for WeChat backend attribution |
 
 ## Architecture
 

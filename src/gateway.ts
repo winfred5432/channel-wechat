@@ -10,6 +10,7 @@ import { ingress, subscribePull, fileDownload } from "./daemon.js";
 import { toSilk, transcribeSilk } from "./voice.js";
 import { OutboxQueue } from "./outbox.js";
 import { StreamingMarkdownFilter } from "./markdown-filter.js";
+import { sleep } from "./timers.js";
 
 const MEDIA_TMP_DIR = "/tmp/channel-wechat-media";
 
@@ -928,11 +929,4 @@ function inferRemoteFileName(mediaUrl: string, mime: string): string {
   }
   const ext = extensionForMime(mime);
   return ext ? `${baseName}${ext}` : baseName;
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
-  });
 }

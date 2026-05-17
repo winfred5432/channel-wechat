@@ -3,6 +3,7 @@
   "version": "0.1.2",
   "type": "module",
   "description": "WeChat channel plugin for duoduo",
+  "ilink_appid": "bot",
   "publishConfig": {
     "access": "public"
   },
@@ -26,6 +27,7 @@
         "WECHAT_ALLOW_FROM",
         "WECHAT_STATE_DIR",
         "WECHAT_LOG_LEVEL",
+        "WECHAT_BOT_AGENT",
         "WECHAT_HEALTH_PORT"
       ]
     }

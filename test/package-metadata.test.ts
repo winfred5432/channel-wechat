@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 type PackageJson = {
   publishConfig?: { access?: string };
+  ilink_appid?: string;
   main?: string;
   files?: string[];
   bin?: Record<string, string>;
@@ -27,6 +28,7 @@ describe("package metadata", () => {
     const pkg = readPackageJson();
 
     expect(pkg.publishConfig?.access).toBe("public");
+    expect(pkg.ilink_appid).toBe("bot");
     expect(pkg.main).toBe("dist/plugin.js");
     expect(pkg.files).toEqual(expect.arrayContaining(["dist/", "README.md", "package.json"]));
     expect(pkg.bin).toEqual({ "duoduo-wechat": "./dist/plugin.js" });
@@ -40,6 +42,7 @@ describe("package metadata", () => {
         "WECHAT_ALLOW_FROM",
         "WECHAT_STATE_DIR",
         "WECHAT_LOG_LEVEL",
+        "WECHAT_BOT_AGENT",
         "WECHAT_HEALTH_PORT"
       ]
     });

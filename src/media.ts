@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { buildBaseInfo, buildCommonHeaders } from "./wechat.js";
 
 // ---------------------------------------------------------------------------
 // AES-128-ECB helpers
@@ -145,7 +146,7 @@ export async function uploadMedia(params: {
     filesize,
     no_need_thumb: true,
     aeskey: aeskey.toString("hex"),
-    base_info: { channel_version: "claude-code-1.0" },
+    base_info: buildBaseInfo(),
   });
 
   const uin = Buffer.from(String(randomBytes(4).readUInt32BE(0))).toString("base64");
@@ -158,6 +159,7 @@ export async function uploadMedia(params: {
       AuthorizationType: "ilink_bot_token",
       Authorization: `Bearer ${token}`,
       "X-WECHAT-UIN": uin,
+      ...buildCommonHeaders(),
     },
     body: reqBody,
   });

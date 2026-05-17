@@ -9,6 +9,8 @@ import {
   getUploadUrl,
   sendMessage,
   splitText,
+  buildBaseInfo,
+  sanitizeBotAgent,
   WechatApiError,
   CHUNK_SIZE,
 } from "../src/wechat.js";
@@ -39,6 +41,9 @@ describe("getQrCode", () => {
     expect(result).toEqual({ qrcode: "QR123", qrcodeImgUrl: "https://img.example.com/qr.png" });
     const calledUrl = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(calledUrl).toContain("get_bot_qrcode?bot_type=3");
+    const opts = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0][1] as RequestInit;
+    expect((opts.headers as Record<string, string>)["iLink-App-Id"]).toBe("bot");
+    expect((opts.headers as Record<string, string>)["iLink-App-ClientVersion"]).toMatch(/^\d+$/);
   });
 
   it("throws on HTTP error", async () => {
@@ -52,6 +57,20 @@ describe("getQrCode", () => {
     const url = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     // URL should not have double slash in path (e.g. .com//ilink)
     expect(url).not.toMatch(/\.com\/\//);
+  });
+});
+
+describe("protocol base_info", () => {
+  it("defaults bot_agent to valid UA-style Duoduo product", () => {
+    expect(buildBaseInfo().bot_agent).toMatch(/^Duoduo\/(?:\d+\.\d+\.\d+|0\.0\.0)$/);
+  });
+
+  it("keeps valid custom UA-style bot agent", () => {
+    expect(sanitizeBotAgent("Duoduo/0.1.2 (prod) SDK/1.0")).toBe("Duoduo/0.1.2 (prod) SDK/1.0");
+  });
+
+  it("falls back invalid custom bot agent to valid UA-style Duoduo product", () => {
+    expect(sanitizeBotAgent("多多")).toMatch(/^Duoduo\/(?:\d+\.\d+\.\d+|0\.0\.0)$/);
   });
 });
 
@@ -165,6 +184,9 @@ describe("getUpdates", () => {
     expect((opts.headers as Record<string, string>)["Authorization"]).toBe("Bearer MYTOKEN");
     const body = JSON.parse(opts.body as string);
     expect(body.get_updates_buf).toBe("MYSYNC");
+    expect(body.base_info.bot_agent).toMatch(/^Duoduo\/(?:\d+\.\d+\.\d+|0\.0\.0)$/);
+    expect(body.base_info.channel_version).toMatch(/^(?:\d+\.\d+\.\d+|unknown)$/);
+    expect((opts.headers as Record<string, string>)["iLink-App-Id"]).toBe("bot");
   });
 
   it("throws WechatApiError on non-zero ret code", async () => {
@@ -191,6 +213,7 @@ describe("sendMessage", () => {
     const body = JSON.parse(opts.body as string);
     expect(body.msg.to_user_id).toBe("user1");
     expect(body.msg.item_list[0].text_item.text).toBe("hello");
+    expect(body.base_info.bot_agent).toMatch(/^Duoduo\/(?:\d+\.\d+\.\d+|0\.0\.0)$/);
     expect(body.msg.context_token).toBeUndefined();
   });
 

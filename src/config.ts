@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { DEFAULT_BOT_AGENT } from "./wechat.js";
 
 export interface Config {
   daemonUrl: string;
@@ -9,6 +10,7 @@ export interface Config {
   allowFrom: string[];
   stateDir: string;
   logLevel: string;
+  botAgent: string;
 }
 
 export function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -49,5 +51,6 @@ export function loadConfig(): Config {
     allowFrom,
     stateDir,
     logLevel,
+    botAgent: process.env.WECHAT_BOT_AGENT?.trim() || DEFAULT_BOT_AGENT,
   };
 }
