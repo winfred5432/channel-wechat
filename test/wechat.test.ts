@@ -74,6 +74,26 @@ describe("protocol base_info", () => {
   it("falls back invalid custom bot agent to valid UA-style Duoduo product", () => {
     expect(sanitizeBotAgent("多多")).toMatch(/^Duoduo\/(?:\d+\.\d+\.\d+|0\.0\.0)$/);
   });
+
+  it("keeps multi-word product comments together", () => {
+    expect(sanitizeBotAgent("Duoduo/0.1.2 (prod canary) SDK/1.0")).toBe("Duoduo/0.1.2 (prod canary) SDK/1.0");
+  });
+
+  it("drops invalid comments but keeps the preceding product token", () => {
+    expect(sanitizeBotAgent("Duoduo/0.1.2 (生产)")).toBe("Duoduo/0.1.2");
+  });
+
+  it("keeps adjacent valid product tokens", () => {
+    expect(sanitizeBotAgent("Duoduo/0.1.2 SDK/1.0")).toBe("Duoduo/0.1.2 SDK/1.0");
+  });
+
+  it("truncates overlong bot agent strings at a valid token boundary", () => {
+    const raw = Array.from({ length: 30 }, (_, i) => `SDK${i}/1.0`).join(" ");
+    const sanitized = sanitizeBotAgent(raw);
+    expect(sanitized).toMatch(/^SDK0\/1\.0/);
+    expect(sanitized.endsWith(" ")).toBe(false);
+    expect(Buffer.byteLength(sanitized, "utf-8")).toBeLessThanOrEqual(256);
+  });
 });
 
 describe("pollQrStatus", () => {
@@ -196,12 +216,27 @@ describe("getUpdates", () => {
     await expect(getUpdates(BASE, "T", "S", fetchFn)).rejects.toThrow(WechatApiError);
   });
 
+  it("throws WechatApiError on non-zero errcode when ret is absent", async () => {
+    const fetchFn = makeFetch({ errcode: -2, errmsg: "expired" });
+    await expect(getUpdates(BASE, "T", "S", fetchFn)).rejects.toThrow("WechatApiError[-2]: expired");
+  });
+
+  it("throws with response body on HTTP error", async () => {
+    const fetchFn = makeFetch({ errmsg: "bad gateway" }, 502);
+    await expect(getUpdates(BASE, "T", "S", fetchFn)).rejects.toThrow('getUpdates HTTP 502: {"errmsg":"bad gateway"}');
+  });
+
   it("returns empty on AbortError", async () => {
     const abortErr = new DOMException("timeout", "AbortError");
     const fetchFn = vi.fn().mockRejectedValue(abortErr) as unknown as typeof fetch;
     const result = await getUpdates(BASE, "T", "OLD", fetchFn);
     expect(result.msgs).toEqual([]);
     expect(result.syncBuf).toBe("OLD");
+  });
+
+  it("rethrows non-timeout transport failures", async () => {
+    const fetchFn = vi.fn().mockRejectedValue(new Error("network down")) as unknown as typeof fetch;
+    await expect(getUpdates(BASE, "T", "OLD", fetchFn)).rejects.toThrow("network down");
   });
 });
 
@@ -275,6 +310,34 @@ describe("sendMessage", () => {
     expect(body.msg.item_list[0].voice_item.playtime).toBe(0);
     expect(body.msg.context_token).toBe("CTX");
   });
+
+  it("sends native voice messages with explicit metadata", async () => {
+    const fetchFn = makeFetch({ ret: 0 });
+    await sendMessage(
+      BASE,
+      "TOKEN",
+      "user1",
+      "",
+      undefined,
+      fetchFn,
+      {
+        kind: "voice",
+        item: {
+          encryptQueryParam: "ENC",
+          aesKeyBase64: "AES",
+          encodeType: 7,
+          sampleRate: 24000,
+          bitsPerSample: 24,
+          playtimeMs: 1234,
+        },
+      },
+    );
+    const body = JSON.parse((fetchFn as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body.msg.item_list[0].voice_item.encode_type).toBe(7);
+    expect(body.msg.item_list[0].voice_item.sample_rate).toBe(24000);
+    expect(body.msg.item_list[0].voice_item.bits_per_sample).toBe(24);
+    expect(body.msg.item_list[0].voice_item.playtime).toBe(1234);
+  });
 });
 
 describe("getConfig", () => {
@@ -287,6 +350,11 @@ describe("getConfig", () => {
     const body = JSON.parse(opts.body as string);
     expect(body.ilink_user_id).toBe("user1");
     expect(body.context_token).toBe("CTX");
+  });
+
+  it("throws on HTTP error", async () => {
+    const fetchFn = makeFetch({}, 500);
+    await expect(getConfig(BASE, "TOKEN", "user1", "CTX", fetchFn)).rejects.toThrow("getConfig HTTP 500");
   });
 });
 
